@@ -1,0 +1,15 @@
+# Never in this repo, and never in its history:
+#   source clips/   a real person's voice recording
+#   out/            generated speech in that voice
+#   test script/    third-party documentation, not ours to redistribute
+# Excluded from the first commit rather than removed later, because taking a
+# file out of git history means rewriting it.
+source clips/
+out/
+test script/
+
+venv/
+torch-ext-cache/
+.cache/
+__pycache__/
+*.pyc
