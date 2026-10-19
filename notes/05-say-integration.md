@@ -6,15 +6,25 @@ session; the parts marked "verified here" I checked myself.
 
 ## The two paths
 
-| | live backend | **prebuild** |
+| | live backend | prebuild |
 |---|---|---|
 | how | `say` POSTs each paragraph to a local server | we fill `say-<doc>/audio/` ahead of time |
 | needs | a running HTTP server | nothing running at read time |
-| speed | gappy at RTF 1.9 | instant — no backend call at all |
+| speed | ~~gappy at RTF 1.9~~ **fine at RTF 0.85** | instant — no backend call at all |
 | code change in `say` | none (generic `http` kind) | none |
 
-Prebuild is the one that fits. `say` reuses saved audio before calling any
-backend, so RTF stops mattering.
+⚠️ **This section used to conclude "prebuild is the one that fits", and
+that is no longer true.** It was written when the measured RTF was 1.9, so
+generation could not keep ahead of a listener and the 8-second prefetch
+lead was marginal. **RTF is now 0.851** (`12-full-run.md`), generation
+outruns playback, and both paths work.
+
+Pick on what you are doing, not on speed:
+
+- **`bin/server.py`** (via `bin/drama3ctl start`) for ad-hoc text. Nothing
+  to prepare, nothing to run first.
+- **`bin/prebuild.py`** for a long document you will read more than once.
+  Still strictly better there: nothing is generated at read time at all.
 
 ## What the maintainer confirmed
 
@@ -104,3 +114,54 @@ nix-shell -p go alsa-lib pkg-config --run 'CGO_ENABLED=1 go build -o say-linux .
 
 Run it with `HOME` and `XDG_CONFIG_HOME` pointed at scratch so it cannot touch
 the real `~/.config`.
+
+
+## The resident server — 2026-10-18
+
+`bin/drama3ctl start|stop|restart|status|log|config`. One model load, many
+requests; `drama3ctl config` prints the exact `say` backend block.
+
+`say`'s `http` kind POSTs a templated JSON body and expects **raw audio
+bytes** back, reading the sample rate from the wav header (`rest.go`). So
+`POST /tts {"text": ...}` returns 44.1 kHz mono PCM_16. `voice` and `speed`
+are accepted and ignored, so a stock config template works unmodified.
+
+Measured on the first real request: **7.38 s of audio in 6.68 s, RTF 0.905.**
+
+### The voice is prepared once, not per request
+
+This is the whole reason it is a resident process. At startup it encodes
+the reference and builds a prefix KV snapshot (117 MiB for a 56 s clip);
+every request restores that instead of re-reading the clip:
+
+```
+request 1:  Drama 3 prefill: 13 of 1257 rows  (1244 reused)
+request 2:  Drama 3 prefill: 34 of 1278 rows  (1244 reused)
+```
+
+**98 % of each prompt is reused.** Without it every paragraph would re-read
+56 seconds of audio — ~1.2 s on a ~7 s request, 17 %.
+
+### IDEA, not built: more than one voice
+
+The voice is fixed at `start` by `DRAMA3_REF`, so changing it means a
+restart. One server per voice does not fit — each holds ~10 GiB of VRAM and
+two will not go in 24 GB.
+
+But the prefix snapshot is **just a dict of tensors, 117 MiB**, and
+`PrefixKV.restore()` already copies a chosen one into the live caches. So:
+build one `PrefixKV` per reference clip at startup, key them by name, and
+pick per request on `{{voice}}` — which `say` already sends and the server
+currently ignores.
+
+Cost is ~117 MiB of VRAM per extra voice against ~10 GiB for a second
+process, and the restore is the same ~53 device-to-device copies it already
+does. The guard in `PrefixKV.applies_to` makes a mismatch fall back to a
+full prefill rather than generating from the wrong voice's state, which is
+the failure that would otherwise be silent.
+
+⚠️ Unmeasured. The obvious risk is that each voice's prefix must be built
+at startup, so N voices is N x ~3 s of prefill and N x 117 MiB, and nobody
+has checked whether switching prefixes between requests leaves anything
+stale in the tower caches. `bin/test_prefix_kv.py` is the shape of the test
+that would answer it.

@@ -10,6 +10,7 @@ investigation; none are theoretical.
 from __future__ import annotations
 
 import os
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -93,9 +94,18 @@ def nvcc_env():
             os.environ["CXX"] = os.path.join(GCC14_BIN, "g++")
         os.environ["CUDA_HOME"] = CUDA_MERGED
         os.environ["TORCH_CUDA_ARCH_LIST"] = cuda_arch()
+        # ⚠️ Key the build cache by torch version AND python ABI. A single
+        # shared directory gets poisoned the moment two interpreters use the
+        # repo: the .so is built against one torch's headers, the next torch
+        # loads it, and the failure is not a clean error -- it was a process
+        # spinning at 65 % CPU inside CUDA-graph capture, with no compiler
+        # running and no message, for minutes. A stale `lock` left by a
+        # killed build makes it worse.
+        import torch as _t
+        tag = f"{_t.__version__}-py{sys.version_info.major}{sys.version_info.minor}"
         os.environ.setdefault(
             "TORCH_EXTENSIONS_DIR",
-            str(Path(__file__).resolve().parent.parent / "torch-ext-cache"))
+            str(Path(__file__).resolve().parent.parent / "torch-ext-cache" / tag))
         os.environ["PATH"] = ":".join(
             p for p in (os.path.join(CUDA_MERGED, "bin"), NINJA_BIN, GCC14_BIN,
                         os.environ.get("PATH", "")) if p)
