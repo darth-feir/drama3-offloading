@@ -53,8 +53,19 @@ is Fish Audio Research, non-commercial.
 |---|---|
 | GPU | **sm_89 or newer** (Ada / Hopper). 24 GB is enough; see below |
 | RAM | **~40 GiB free.** `--pin-experts` page-locks 30 GiB of it |
-| disk | ~39 GiB of weights |
-| python | 3.12 (several upstream deps cap below 3.13) |
+| disk | ~50 GiB — 39 of weights, ~7 of venv, the rest output |
+| python | **3.12.** Several upstream deps cap below 3.13 |
+| **ffmpeg** | on `PATH`. Every reference clip goes through it; not optional |
+| **CUDA toolkit** | `nvcc` **and headers**, plus `ninja` and a **g++ ≤ 14**, to build `csrc/fetch_experts.cu`. See below — there is a fallback |
+
+**The CUDA toolkit is only needed for `--fetch-backend cpp`**, which is the
+default and what every measurement here used. With no compiler, pass
+`--fetch-backend triton`: same job, pure Triton, no build step. Verified to
+run; **never benchmarked against `cpp`**, so no claim either way on speed.
+
+⚠️ **g++ 15 will not work.** CUDA 12.9's `crt/host_config.h` hard-errors
+above gcc 14. Point `DRAMA3_CXX` at an older one if your system compiler is
+newer — this is the single most likely thing to stop the build.
 
 ⚠️ **sm_89 is not a preference, it is the premise.** The design rests on
 native FP8 tensor cores. On Ampere (3090, sm_86) there are none, the loader
@@ -81,21 +92,49 @@ against the 80 these measurements used. 16 GB is where it stops hurting.
 ## Setup
 
 ```bash
-git clone https://github.com/fishaudio/fish-speech   # unmodified
-git clone <this repo> drama3-offloading
+# 1. fish-speech, used UNMODIFIED and not vendored here
+git clone https://github.com/fishaudio/fish-speech
+git clone git@github.com:darth-feir/drama3-offloading.git
 cd drama3-offloading
 
+# 2. a python 3.12 venv
 python3.12 -m venv venv
-venv/bin/pip install torch torchaudio torchcodec triton soundfile loguru tokenizers tqdm
+venv/bin/pip install torch torchaudio torchcodec triton \
+                     numpy soundfile loguru tokenizers tqdm \
+                     "huggingface_hub[cli]"
 venv/bin/pip install -e ../fish-speech
 
-huggingface-cli download fishaudio/drama-3
+# 3. the weights: 36.9 GiB + a 1.87 GiB codec. Set HF_HOME first if you
+#    do not want them in ~/.cache.
+export HF_HOME=/somewhere/with/40GB
+venv/bin/huggingface-cli download fishaudio/drama-3
 
-source bin/env.sh      # defaults assume ../fish-speech; override DRAMA3_FISH
+# 4. environment. Defaults assume ../fish-speech and find the weights
+#    under HF_HOME; override DRAMA3_FISH / DRAMA3_CKPT if not.
+source bin/env.sh
 ```
 
-`bin/env.sh` documents every environment variable. The only ones most people
-need are `DRAMA3_FISH` and `DRAMA3_CKPT`, and both have working defaults.
+`bin/env.sh` documents every variable it reads and why. Most people need
+none of them.
+
+### Check it works before committing an hour to it
+
+```bash
+bin/run.sh bin/narrate.py \
+  --text-file document.txt --out-dir out/smoke \
+  --ref myvoice.wav --ref-text "what the clip says" \
+  --dev-cache --fetch-backend cpp --cuda-graph 1 --pin-experts \
+  --vram-reserve 2 --prefill-chunk 1024 \
+  --prefix-kv --slice-lm-head --offload-embed \
+  --limit 2
+```
+
+`--limit 2` does the full load, the CUDA build, graph capture and two
+paragraphs in about two minutes, and writes `out/smoke/full.wav`. If that
+is right, drop `--limit` and run the document.
+
+There is also `bin/check_botnotes.py`, which needs no GPU, no model and no
+dependencies — a quick way to confirm the checkout itself is intact.
 
 ## Running it
 
