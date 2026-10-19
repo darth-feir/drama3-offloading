@@ -99,15 +99,22 @@ cd drama3-offloading
 
 # 2. a python 3.12 venv
 python3.12 -m venv venv
-venv/bin/pip install torch torchaudio torchcodec triton \
+
+# ⚠️ --no-deps is deliberate. fish-speech declares 27 dependencies, one of
+#    which is pyaudio -- it needs a C compiler and portaudio headers, it
+#    fails to build without them, and nothing here records audio. The list
+#    below is what this project actually imports, established by installing
+#    nothing and adding whatever raised ImportError until it ran.
+venv/bin/pip install -e ../fish-speech --no-deps
+venv/bin/pip install "torch==2.8.0" "torchaudio==2.8.0" torchcodec triton \
                      numpy soundfile loguru tokenizers tqdm \
-                     "huggingface_hub[cli]"
-venv/bin/pip install -e ../fish-speech
+                     safetensors hydra-core transformers einops \
+                     descript-audio-codec huggingface_hub
 
 # 3. the weights: 36.9 GiB + a 1.87 GiB codec. Set HF_HOME first if you
 #    do not want them in ~/.cache.
 export HF_HOME=/somewhere/with/40GB
-venv/bin/huggingface-cli download fishaudio/drama-3
+venv/bin/hf download fishaudio/drama-3   # 'huggingface-cli' in hub < 1.0
 
 # 4. environment. Defaults assume ../fish-speech and find the weights
 #    under HF_HOME; override DRAMA3_FISH / DRAMA3_CKPT if not.
@@ -116,6 +123,15 @@ source bin/env.sh
 
 `bin/env.sh` documents every variable it reads and why. Most people need
 none of them.
+
+⚠️ **torch is pinned to 2.8.0 on purpose.** It is what fish-speech pins and
+what every measurement here was taken on. Unpinned, `pip install torch`
+currently resolves to 2.14.1+cu130.
+
+2.14.1 does work — verified, correct audio — but **CUDA-graph capture takes
+54.9 s on it against ~2.5 s on 2.8.0**, a one-time startup cost that is
+noise over a long document and brutal over a short one. Steady-state speed
+on 2.14 was not measured, so no claim either way.
 
 ### Check it works before committing an hour to it
 
