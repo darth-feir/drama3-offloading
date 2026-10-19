@@ -19,6 +19,11 @@ prefill gather: 37.6% served from VRAM
 
 **27.0 minutes of wall clock for 31 minutes of audio.**
 
+⚠️ **0.851 is generation only; all-in it is 0.869**, counting the 32.5 s of
+startup. Both figures were later verified against the PCM frame counts of
+all 235 output files rather than the run's own bookkeeping — they agree to
+the hundredth of a second. See `14-packaging.md`.
+
 ## The user's verdict
 
 **"v5 is the best sounding so far by far."** (2026-10-18, on the full

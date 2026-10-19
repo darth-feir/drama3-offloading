@@ -59,6 +59,18 @@ slice. Fixed, and it is part of the working config above. See `10`.
    silence until the cap. Changing to 1.0/0.9/4097 took content loss from
    5/235 chunks to **0/235**.
 
+## Since this was written
+
+- The full script ran end to end: **RTF 0.851**, 235/235 clean, nothing
+  dropped (`12-full-run.md`). Verified three ways (`14-packaging.md`).
+- The reference clip went 28.2 s -> 56 s, which the user judged "the best
+  sounding so far by far". Reference length is the live quality lever;
+  prefix reuse made it nearly free (`11-reference-length.md`).
+- This became a standalone, publishable repository: paths resolved from the
+  environment, no Nix store hashes, the STT daemon optional, and setup
+  instructions that have actually been executed in a clean room
+  (`14-packaging.md`).
+
 ## Next, in priority order
 
 ### 1. Prefix KV reuse -- ✅ DONE 2026-10-18, see `09-prefix-kv.md`
