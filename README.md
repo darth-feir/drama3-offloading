@@ -19,6 +19,10 @@ In the usual shorthand that is **RTF 0.85** — real-time factor, seconds of
 compute per second of audio, so below 1.0 means it generates faster than you
 can listen. It started at 3.90.
 
+<sub>That 0.85 is generation only; counting the 32.5 s of startup it is
+0.869 all-in. Both verified against the PCM frame counts of the 235 output
+files, not just the run's own bookkeeping.</sub>
+
 The trick is that a mixture-of-experts model only uses a fraction of itself
 per token. 30 GiB of expert weights live in **system RAM** and stream over
 PCIe on demand; only the 6.9 GiB that every token needs stays resident.
@@ -128,10 +132,22 @@ none of them.
 what every measurement here was taken on. Unpinned, `pip install torch`
 currently resolves to 2.14.1+cu130.
 
-2.14.1 does work — verified, correct audio — but **CUDA-graph capture takes
-54.9 s on it against ~2.5 s on 2.8.0**, a one-time startup cost that is
-noise over a long document and brutal over a short one. Steady-state speed
-on 2.14 was not measured, so no claim either way.
+2.14.1 does work — verified, correct audio — and **steady-state speed is
+the same**: RTF excluding graph capture came out 0.873 on 2.14.1 against
+0.861 on 2.8.0 over the same 20 chunks, a gap inside run-to-run variation.
+
+What differs is **capture: 54.9 s and 82.4 s on two 2.14.1 runs, against
+2.1–2.5 s on 2.8.0.** A one-time cost, so ~3 % of a 31-minute document and
+80 % of a two-chunk test. If a short run reports an alarming RTF, check the
+`captured in …s` line before concluding anything:
+
+```
+                        RTF    capture    RTF excluding capture
+2 chunks,  torch 2.14   5.333    54.9 s           0.938
+20 chunks, torch 2.14   1.206    82.4 s           0.873
+20 chunks, torch 2.8    0.872     2.5 s           0.861
+235 chunks, torch 2.8   0.851     2.1 s           0.850
+```
 
 ### Check it works before committing an hour to it
 
