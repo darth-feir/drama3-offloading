@@ -42,6 +42,22 @@ fine":
 faithfulness, drift and cost, and it zeroes the caches before restoring so a
 restore that copies nothing cannot pass by accident.
 
+## Before you trust the setup instructions
+
+`bin/cleanroom.sh DIR [pinned|latest]` builds a fresh venv and a fresh
+fish-speech clone and installs per the README, so the instructions can be
+executed rather than read.
+
+They were written twice, believed twice, and were wrong six ways — an
+unpinned torch, a `pip install` that fails on a C extension nothing here
+uses, four packages missing for import, one more missing at runtime behind
+a misleading hydra error, and a renamed CLI binary. None of that is
+findable by rereading. **If you change the dependencies, run it.**
+
+`latest` mode installs whatever pip resolves today instead of the pinned
+versions. Useful as a forward-compatibility canary; the timings from it are
+not project numbers.
+
 ## Things that are open
 
 - `bin/prebuild.py` has never been run for real against a `say` installation.
