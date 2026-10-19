@@ -13,23 +13,10 @@ import os
 from contextlib import contextmanager
 from pathlib import Path
 
-# Toolchain discovery. The original of this file hardcoded three Nix store
-# hashes, which is correct on exactly one machine and on that machine only
-# until `nix-collect-garbage` runs -- they are not gc roots.
-#
-# Order: explicit env var, then whatever is on PATH (right on every ordinary
-# distro), then a Nix store glob (right on NixOS, where nvcc is usually not
-# on PATH at all). Each is overridable so a broken guess is a one-line fix
-# rather than an edit to this file.
-#
-#   DRAMA3_CUDA_HOME   a CUDA toolkit with BOTH bin/nvcc and include/.
-#                      ⚠️ On NixOS use the *merged* derivation: the
-#                      nvcc-only one has no headers and cpp_extension needs
-#                      both.
-#   DRAMA3_CXX         host compiler for nvcc. CUDA 12.9 hard-errors above
-#                      gcc 14 (crt/host_config.h).
-#   DRAMA3_CUDA_ARCH   e.g. "8.9" for Ada / RTX 4090, "9.0" for Hopper.
-#                      Detected from the GPU when unset.
+# Toolchain discovery: env var, then PATH, then a Nix store glob. Override
+# with DRAMA3_CUDA_HOME (needs bin/nvcc AND include/), DRAMA3_CXX, or
+# DRAMA3_CUDA_ARCH. Nothing is hardcoded -- Nix store paths are not gc roots.
+# see notes/botnotes/toolchain-discovery.md
 
 _ext = None
 _err = None

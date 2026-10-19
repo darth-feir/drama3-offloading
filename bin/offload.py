@@ -140,14 +140,11 @@ def offloaded_forward(self, x: Tensor, topk_ids: Tensor, topk_weights: Tensor) -
     TRACE.add(getattr(self, "_layer_index", -1), topk_ids)
     if self.w13_weight.device.type != "cpu":
         return MoEExperts._stock_forward(self, x, topk_ids, topk_weights)
-    # Dispatch on the per-layer capacity alone. Checking the CACHE_EXPERTS
-    # global as well was a bug: --vram-reserve allocates the cache without
-    # setting that global, so 8.32 GiB of cache sat allocated and unused and
-    # the run was silently no faster than having none. The missing hit-rate
-    # line in the log was the only clue.
-    # graphstub is a diagnostic that must override everything: it is the only
-    # sync-free path, and a cache allocated by --vram-reserve would otherwise
-    # shadow it and send capture straight into cached_forward's .cpu() sync.
+    # Dispatch on the per-layer capacity ALONE -- also checking the
+    # CACHE_EXPERTS global left 8.32 GiB of cache allocated and never used.
+    # graphstub is tested first: it is the only sync-free path and a cache
+    # would shadow it into a .cpu() sync, which is illegal during capture.
+    # see notes/botnotes/cache-dispatch-guard.md
     if COPY_MODE == "graphstub":
         return _graph_stub(self, x, topk_ids, topk_weights, x.device)
     if getattr(self, "_cap", 0):
@@ -195,24 +192,12 @@ def offloaded_forward(self, x: Tensor, topk_ids: Tensor, topk_weights: Tensor) -
         w2 = torch.empty(
             (n, *self.w2_weight.shape[1:]), dtype=self.w2_weight.dtype, device=device
         )
-        # Take whatever the device cache already holds from VRAM instead of
-        # pulling it over PCIe again.
-        #
-        # WHY: measured (notes/10) a prefill batch is 96.5 % weight transfer
-        # running at 25.8 GB/s -- the pinned PCIe roof -- and 28.1 % of the
-        # experts it fetches are ALREADY RESIDENT. This path never looked, so
-        # its hit rate was zero by construction, not because the experts were
-        # absent. A device-to-device copy is ~1.5 TB/s against ~25 GB/s.
-        #
-        # The lookup needs the slot table on the host, but `unique()` above
-        # already paid a host sync, so this rides a sync that exists.
-        #
-        # ⚠️ READ-ONLY, DELIBERATELY. No insert, no stamp bump. A prefill
-        # batch wants ~196 experts per layer against a 62-slot cache, so
-        # letting it populate would evict decode's working set wholesale --
-        # and decode is 80 % of runtime. Prefill borrows what happens to be
-        # there and leaves the LRU ordering to decode. If you change this,
-        # measure decode, not prefill.
+        # Serve resident experts from VRAM (~1.5 TB/s) instead of re-fetching
+        # them over PCIe (~25 GB/s); prefill is 96.5 % weight transfer and 28 %
+        # of what it fetched was already there.
+        # ⚠️ READ-ONLY: no insert, no stamp bump, or prefill evicts decode's
+        # working set. If you change this, measure decode, not prefill.
+        # see notes/botnotes/prefill-hybrid-gather.md
         slot_of = getattr(self, "_dc_slot_of", None) if HYBRID_GATHER else None
         if slot_of is not None:
             # slot_of[e] >= 0 implies slot holds expert e: _resolve_slots
@@ -336,18 +321,10 @@ STUB_EXPERTS = 8
 
 
 def _graph_stub(self, x, topk_ids, topk_weights, device):
-    # TIMING ONLY -- THE AUDIO IS GARBAGE.
-    #
-    # Measures CUDA-graph capture against eager on the real attention,
-    # tower and sampling path, with a synthetic MoE that has NO host
-    # sync. Graphs cannot capture the real path because every layer does
-    # topk_ids.cpu() to decide what to fetch, which is illegal during
-    # capture; this replaces that with `topk_ids % cap`, a pure GPU op.
-    #
-    # The expert weights are junk and resident, so the routing is wrong
-    # and the output is noise. What stays real is the ~4,600 small kernel
-    # launches per decode step across attention, the 13-layer tower and
-    # 10 sampling passes -- which is where the dispatch overhead lives.
+    # ⚠️ TIMING ONLY -- THE AUDIO IS GARBAGE. Junk resident weights and
+    # `topk_ids % cap` instead of a real lookup, so capture has no host sync.
+    # Real: the ~4,600 kernel launches per step, which is what is measured.
+    # see notes/botnotes/graphstub-timing-only.md
     cap = STUB_EXPERTS
     buf = getattr(self, "_stub", None)
     if buf is None:
@@ -511,45 +488,12 @@ def slice_lm_head(model, device: torch.device) -> float:
     del full, sliced
     torch.cuda.empty_cache()
 
-    # ⚠️ Pre-allocated, not allocated per call. The first version created a
-    # fresh torch.full(-inf) buffer inside compute_logits, which sits inside
-    # the CUDA-graph captured region; with graphs on, every chunk died with
-    # "non-finite logits" while the identical run without the slice was fine.
-    # fill_ and index-assign are capturable; allocation is not safely so.
-    #
-    # compute_logits is only ever called with one row (generate.py:252 does
-    # hidden = hidden[-1:], and the graph path uses a (1, hidden) buffer), so
-    # one buffer suffices; anything wider falls back to allocating and is not
-    # capture-safe, which is fine because it cannot occur in the decode path.
-    # ⚠️ The padding is the most-negative FINITE value, not -inf, and that is
-    # the whole reason --slice-lm-head now works under --cuda-graph 1.
-    #
-    # THE BUG, for anyone tempted to put -inf back. `Drama3DecodeGraphs.run`
-    # (generate.py:376-377) does
-    #
-    #     logits = backbone.compute_logits(self.hidden)
-    #     self.finite.copy_(torch.isfinite(logits).all())
-    #
-    # over the FULL 252,288-wide tensor. Fill 248,191 of those with -inf and
-    # that check is False on the very first step, every step, forever --
-    # which is exactly the "non-finite logits; refusing to sample invalid
-    # audio" that killed every chunk. The slice was never producing bad
-    # numbers; it was tripping a guard with its own sentinel.
-    #
-    # Eager decode did not care because the guard that runs there lives in
-    # `sample_top_k_top_p` and only ever sees `logits[:, candidates]`
-    # (tower.py:349-353) -- the 4,097 real values, all finite. That
-    # difference is why this looked like a CUDA-graph bug for a day.
-    #
-    # Nothing reads the padded positions except that check: the only other
-    # consumer indexes by `candidates`. finfo.min softmaxes to exactly 0 the
-    # same way -inf does, so the sampled distribution is unchanged, while a
-    # genuine Inf/NaN out of the GEMM still trips the guard.
-    #
-    # An earlier fix attempt -- pre-allocating this buffer instead of
-    # allocating one per call -- was addressing a real and separate hazard
-    # (allocation inside a captured region) and is kept. It was not the
-    # cause, which is why it did not help on its own.
+    # ⚠️ Pad with the most-negative FINITE value, not -inf. The graph's own
+    # finiteness guard scans the FULL 252,288-wide tensor, so -inf here
+    # fails it on every step -- which is not a CUDA-graph bug even though it
+    # looks exactly like one. The buffer is pre-allocated because allocation
+    # inside a captured region is a separate hazard.
+    # see notes/botnotes/lm-head-inf-sentinel.md
     pad = torch.finfo(head.weight.dtype).min
 
     wide_buf = torch.full((1, vocab), pad, device=device,
@@ -605,19 +549,11 @@ def offload_embed(model, device: torch.device) -> float:
     row_of = torch.full((vocab,), -1, dtype=torch.long, device=device)
     row_of[cand.to(device)] = torch.arange(len(cand), device=device)
 
-    # ⚠️ The host table is held in this closure, NOT left as the module's
-    # parameter, and that is load-bearing. `Drama3DecodeGraphs.for_model`
-    # (generate.py:350-353) does
-    #
-    #     devices = {p.device for p in model.backbone.parameters()}
-    #     if len(devices) != 1 or ...: return None
-    #
-    # so one CPU parameter anywhere in the backbone silently turns CUDA
-    # graphs OFF -- and graphs are worth RTF 1.71 -> 0.97, which is twenty
-    # times this change. The experts get away with living on the host
-    # because they are registered as *buffers*; an embedding weight is a
-    # Parameter. Replacing the module with a 4,097-row one keeps every
-    # backbone parameter on the GPU.
+    # ⚠️ The host table lives in this closure, NOT as the module's Parameter:
+    # one CPU parameter anywhere in the backbone silently disables CUDA graphs
+    # (for_model checks parameters(), and experts get away with it only because
+    # they are buffers). Graphs are worth 20x what this change saves.
+    # see notes/botnotes/embed-offload-capture-branch.md
     import torch.nn as nn
     small = nn.Embedding(len(cand), hidden, device=device, dtype=host.dtype)
     with torch.no_grad():
@@ -636,17 +572,11 @@ def offload_embed(model, device: torch.device) -> float:
     def embed(self, input_ids: Tensor) -> Tensor:
         ids = input_ids.to(device)
         rows = row_of[ids]
-        # ⚠️ The branch is decided by `is_current_stream_capturing`, NOT by
-        # row count. The tempting test is "one row means decode", and it is
-        # wrong: a prefill whose length is 1 mod --prefill-chunk ends with a
-        # single-row batch carrying an arbitrary text id, which would then
-        # read row -1 of the resident slice. Capture state is exact.
-        #
-        # Inside capture the ids are in-band by construction -- the only
-        # thing decode ever embeds is `sampled[:, 0]`, and `decode_step`
-        # draws it from `main_candidates` (tower.py:349-357), including
-        # during the warm-up passes, where the zeroed buffers still go
-        # through the sampler. Replay does not call this at all.
+        # ⚠️ Branch on CAPTURE STATE, not row count. "One row means decode"
+        # is wrong: a prefill of length 1 mod --prefill-chunk ends in a
+        # single-row batch holding an arbitrary text id, which would read
+        # row -1 of the slice and return the wrong word's embedding.
+        # see notes/botnotes/embed-offload-capture-branch.md
         if torch.cuda.is_current_stream_capturing():
             return torch.nn.functional.embedding(rows, resident)
         if bool((rows >= 0).all()):

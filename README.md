@@ -41,6 +41,19 @@ dequantises every expert to bf16 on load, and 30 GiB becomes 60 GiB — at
 which point there is nothing to offload *to*. This has not been tried on
 Hopper.
 
+⚠️ **sm_89 means Ada or newer**: RTX 40-series, Ada workstation cards,
+Hopper. **Not** Ampere — a 3090's 24 GB does not help, it has no FP8. Not
+Turing, not AMD, not Apple. `notes/13-non-ada-gpus.md` sets out what it
+would take to lift that, and why it is more tractable than it looks: the
+per-expert dequantise needed already exists upstream, wired to the wrong
+switch.
+
+**VRAM floor**, measured, resident after load before any expert cache:
+10.72 GiB plain, 9.77 with `--slice-lm-head`, **8.83 with `--offload-embed`
+as well**. Add ~1.2–1.5 GiB of activation headroom, so ~10.3 GiB is the
+minimum to run at all and 12 GB leaves room for ~14 experts/layer of cache
+against the 80 these measurements used. 16 GB is where it stops hurting.
+
 ⚠️ **Everything here was measured on one machine** — a 4090, a 7950X3D and
 125 GiB of RAM, on NixOS. The numbers are real but they are n=1.
 

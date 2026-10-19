@@ -230,14 +230,10 @@ def snap_to_silence(src: Path, seconds: float, search: float = 8.0) -> float:
         elif not q and run_start is not None:
             runs.append((run_start, i))
             run_start = None
-    # ⚠️ Close a run that reaches the end of the file. Without this, the loop
-    # above only ever records a silence that is followed by more speech, so
-    # the trailing silence of a cleanly-ended recording is invisible and the
-    # snap falls back to the last INTERIOR gap. Measured on this project's
-    # 56.0 s clip: speech to 55.8 s, silence to the end, and the snap chose
-    # 51.7 s -- throwing away 4.3 s (8 %) of a reference for no reason.
-    # `clamp_internal_silence` already handles this case; this function did
-    # not, and the asymmetry is the whole bug.
+    # ⚠️ Close a run reaching the end of the file. Without this the trailing
+    # silence of a cleanly-ended recording is invisible and the snap falls
+    # back to the last INTERIOR gap -- 8 % of this project's clip, silently.
+    # see notes/botnotes/snap-trailing-silence.md
     if run_start is not None:
         runs.append((run_start, n))
     best = None
@@ -477,14 +473,10 @@ def main() -> None:
         with stage("offload embed", device):
             freed = offload.offload_embed(model, device)
         print(f"embed_tokens moved to host RAM; freed {freed:.2f} GiB", flush=True)
-    # The codec turns the model's codes into a waveform. On the GPU it holds
-    # 1.74 GiB that could instead cache ~14 more experts per layer. Measured
-    # on CPU it decodes at 0.64-0.73x realtime, so while the GPU is generating
-    # the next chunk at RTF ~1.0 the decode hides completely.
-    #
-    # ⚠️ The headroom shrinks as generation gets faster. At RTF 0.64 the CPU
-    # becomes the bottleneck and caps the pipeline. Worth it while generation
-    # is near 1.0; revisit if it drops much below.
+    # ⚠️ --codec-cpu frees 1.74 GiB but was measured 50 % SLOWER overall
+    # (RTF 0.99 -> 1.49): decode_to_audio is inline, so CPU decode lands in
+    # the critical path. The codec is 0.5 % of generation time on the GPU.
+    # see notes/botnotes/codec-on-cpu-rejected.md
     codec_device = "cpu" if args.codec_cpu else device
     with stage("codec load", device):
         codec = load_codec_model(resolve_codec_path(Path(args.checkpoint)),
@@ -626,21 +618,10 @@ def main() -> None:
                           else frame_budget(chunk, args.max_new_tokens))
                 if attempt and best is not None:
                     budget = args.max_new_tokens      # be generous on retries
-                # prefill_chunk_size defaults to 128 upstream. With experts
-                # offloaded, each prefill batch fetches every expert it routes
-                # to, and that count saturates near 256 regardless of batch
-                # size -- so small batches re-fetch the same experts over and
-                # over. Bigger batches amortise it.
-                # Timing runs with a stub MoE cannot rely on generation
-                # behaviour: zeroed stub weights made graph capture NaN,
-                # random ones made the model emit EOS immediately. Disabling
-                # the EOS comparison forces exactly max_new_tokens steps so
-                # both arms of an A/B do identical work.
-                #
-                # ⚠️ It MUST be restored: build_drama3_prompt validates
-                # tokenizer.token_to_id("<|im_end|>") == config.eos_token_id,
-                # so leaving it at -1 fails every subsequent chunk with
-                # "tokenizer/config mismatch".
+                # ⚠️ eos_token_id is restored in the finally below. Leaving
+                # it at -1 fails EVERY SUBSEQUENT chunk with "tokenizer/config
+                # mismatch" -- the error surfaces one chunk late.
+                # see notes/botnotes/ignore-eos-and-prefill-chunk.md
                 saved_eos = model.config.eos_token_id
                 if args.ignore_eos:
                     model.config.eos_token_id = -1
