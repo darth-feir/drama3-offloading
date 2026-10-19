@@ -19,6 +19,7 @@ in place rather than deleted, so the reasoning survives.
 | `11-reference-length.md` | **Reference length is now free**: 28.5 s / 51.7 s / 56 s all land RTF 0.85-0.90 with no trend. Use the full clip. Also a `snap_to_silence` bug that silently discarded the tail of any cleanly-ended recording (8 % of this clip), and ⚠️ a CUDA-graph-bucket causal story I published from two points and the third contradicted. |
 | `12-full-run.md` | **The whole 30-minute script, end to end.** 235/235 ok, RTF 0.85, 27 min wall for 31 min of audio, stage-by-stage timing. STT over every chunk: nothing dropped. ⚠️ Also a scorer artefact to know about — a numeral spoken as a word scores 0.00 and looks exactly like a dropped chunk. |
 | `13-non-ada-gpus.md` | **DESIGN ONLY, nothing run.** Why this needs an Ada NVIDIA card today, and how to lift that: split the one `fp8` flag into storage vs compute, because the per-expert dequantise it needs already exists upstream and is wired to the wrong switch. Covers AMD, the ~10.3 GiB VRAM floor, and the one experiment that decides whether any of it is possible. |
+| `botnotes/` | The long version of short code comments. A `see notes/botnotes/<slug>.md` pointer in the code means the full story — what was tried, what broke, what the measurement was — is in there. Each one carries a **What breaks if you change it back** section. `bin/check_botnotes.py` fails on a dead pointer or an orphan. |
 | `TODO-pause-handling.md` | Requested: punctuation-aware pause clamping (`;`, em dash) instead of a flat 0.5 s cap. |
 
 ## House rule followed here

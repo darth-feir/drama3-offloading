@@ -1,23 +1,44 @@
 # Drama 3 on 24 GB — expert offloading
 
-Run [fishaudio/drama-3](https://huggingface.co/fishaudio/drama-3) — 35B-A3B
-MoE, FP8, **36.9 GiB of weights** — on a single 24 GB RTX 4090, **faster
-than real time**.
+**Narrate long documents in a cloned voice, on a GPU that officially cannot
+hold the model.**
 
-Measured on a 31-minute document: **RTF 0.85**, 27 minutes of wall clock,
-235/235 chunks generated with nothing dropped. 30 GiB of routed experts live
-in system RAM and stream over PCIe during generation.
+[fishaudio/drama-3](https://huggingface.co/fishaudio/drama-3) is a
+text-to-speech model: give it ~30–60 seconds of someone speaking plus a
+transcript, and it reads whatever you hand it in that voice. It is 35B-A3B
+mixture-of-experts, FP8, **36.9 GiB of weights**, and upstream states a
+**48 GB minimum**.
 
-Upstream states a 48 GB minimum and its `--device` flag does multi-GPU model
-parallelism, not CPU offload.
+This runs it on a single **24 GB RTX 4090**, faster than it plays:
 
-## How it works, in one paragraph
+> **A 31-minute document took 27 minutes of wall clock.** 235 of 235
+> paragraphs generated, nothing dropped, nothing truncated. Peak 20.3 GiB
+> of VRAM and 38.9 GiB of system RAM.
 
-Drama 3 is 256 experts per layer across 40 layers, 8 active per token — 32:1
-sparsity, so a single token touches ~0.94 GiB of expert weights rather than
-all 30. Keep the 6.9 GiB of non-expert weights resident, keep as many hot
-experts in VRAM as fit, hold the rest pinned in host RAM, and fetch misses
-with a `uint4` CUDA kernel that runs *inside* a captured CUDA graph.
+In the usual shorthand that is **RTF 0.85** — real-time factor, seconds of
+compute per second of audio, so below 1.0 means it generates faster than you
+can listen. It started at 3.90.
+
+The trick is that a mixture-of-experts model only uses a fraction of itself
+per token. 30 GiB of expert weights live in **system RAM** and stream over
+PCIe on demand; only the 6.9 GiB that every token needs stays resident.
+Upstream's `--device` flag does multi-GPU model parallelism, not this.
+
+**You provide:** a voice clip and a text file. **You get:** a wav per
+paragraph plus a stitched whole, resumable if it dies halfway.
+
+## How it works
+
+256 experts per layer across 40 layers, **8 active per token** — 32:1
+sparsity, so one token touches ~0.94 GiB of expert weights rather than all
+30. Keep the non-expert weights resident, keep as many hot experts in VRAM
+as fit, pin the rest in host RAM, and fetch misses with a `uint4` CUDA
+kernel that runs *inside* a captured CUDA graph.
+
+At 21.5 tokens/sec that is ~20 GiB/s of PCIe traffic with a zero percent
+cache hit rate — already borderline inside PCIe 4.0 x16, and every hit
+makes it comfortable. That arithmetic is why this model is worth offloading
+and why a dense one of the same size is not.
 
 ## What it is not
 
@@ -166,6 +187,7 @@ csrc/fetch_experts.cu  uint4 expert fetch that replays correctly inside a graph
 bin/test_*.py        correctness: bit-identity of every lossless transform
 bin/prefill_probe.py measure where a prefill batch's time actually goes
 notes/               how all of it was measured, including the wrong turns
+notes/botnotes/      the long version of short code comments
 ```
 
 **`notes/` is the part with the longest shelf life.** 14 files of measured
