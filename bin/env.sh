@@ -35,6 +35,11 @@ export DRAMA3_VENV
 # single word "placeholder" against 56 s of unrelated speech cost nothing
 # detectable in timbre or content. It did speak ~8 % slower.
 #
+# Browser clients: set an origin to enable CORS. OFF by default, and
+# never applied to /admin/* -- this server has no auth and /admin/voices
+# can delete a voice, so "*" would let any page you visit administer it.
+#   export DRAMA3_CORS=http://localhost:3000
+#
 # Where the compiled CUDA extension is cached. Defaults to
 # torch-ext-cache/ beside the code, which needs a WRITABLE checkout:
 #   export DRAMA3_EXT_CACHE=/var/tmp/drama3-ext

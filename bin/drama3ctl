@@ -373,13 +373,29 @@ PY
 cmd_defaultvoice() {
     local name="${1:-}"
     [ -n "$name" ] || { echo "usage: $(basename "$0") --defaultvoice NAME" >&2; return 2; }
+    # Tell the running server, not just the disk -- the same mistake
+    # --delvoice would have made: files updated, process unaware.
+    if current_pid >/dev/null; then
+        "$REPO/bin/run.sh" - "$(base_url)" "$name" <<'PY'
+import json, sys, urllib.request
+url, name = sys.argv[1:3]
+req = urllib.request.Request(url.rstrip("/") + "/admin/voices/default",
+                             data=json.dumps({"name": name}).encode(),
+                             headers={"Content-Type": "application/json"})
+try:
+    with urllib.request.urlopen(req, timeout=30) as r:
+        print(f"default voice is now {json.load(r)['default']!r}")
+except urllib.error.HTTPError as exc:
+    print(exc.read().decode()[:300], file=sys.stderr); sys.exit(1)
+PY
+        return $?
+    fi
     "$REPO/bin/run.sh" - "$name" <<'PY'
 import sys; sys.path.insert(0, "bin")
 import voices
 voices.set_default(sys.argv[1])
 print(f"default voice is now {sys.argv[1]!r}")
 PY
-    current_pid >/dev/null && echo "restart to apply:  $(basename "$0") --restart"
 }
 
 case "${1:-}" in

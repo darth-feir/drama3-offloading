@@ -67,6 +67,8 @@ import torch
 import config
 import narrate
 import offload
+CORS = os.environ.get("DRAMA3_CORS", "").strip()
+
 import prefix_kv
 from fish_speech.models.text2semantic.fish_omni.model import FishOmniModel
 from fish_speech.models.text2semantic.fish_omni.generate import build_drama3_prompt
@@ -456,6 +458,13 @@ class Engine:
             raise ValueError(f"unknown voice {name!r}; have: {known}")
         if self.default_voice and self.default_voice in self.voices:
             return self.voices[self.default_voice]
+        # ⚠️ Mirror voices.get_default(): one registered voice IS the
+        # default. Without this the server fell back to its --ref clip
+        # whenever an explicit default had been cleared -- e.g. after
+        # removing the voice that held it -- so /v1/voices advertised a
+        # voice that requests were not actually using.
+        if len(self.voices) == 1:
+            return next(iter(self.voices.values()))
         return self.prefix
 
     def speak(self, text: str, voice: str | None = None) -> np.ndarray:
@@ -578,27 +587,104 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *a):      # quieter than the default
         pass
 
+    # ⚠️ CORS is OPT-IN and never applies to /admin.
+    #
+    # Browsers block any page from calling this server without it, so a
+    # browser-based client cannot work at all -- that is the reason to
+    # have it. But this server has NO AUTH, and /admin/voices can delete
+    # a voice or build one from a server-side path. With
+    # Access-Control-Allow-Origin: * on those routes, any page the user
+    # happens to visit could delete their voices. The README already
+    # warns against exposing the port; enabling CORS by default would
+    # quietly undo that warning for every browser tab.
+    #
+    # So: off unless DRAMA3_CORS is set, and the header is attached only
+    # to the public read/speech routes. Set it to a specific origin
+    # rather than "*" if you can.
+    def _cors_origin(self) -> str:
+        if not CORS:
+            return ""
+        if self.path.rstrip("/").startswith("/admin"):
+            return ""
+        return CORS
+
     def _send(self, code: int, body: bytes, ctype: str) -> None:
         self.send_response(code)
         self.send_header("content-type", ctype)
         self.send_header("content-length", str(len(body)))
+        origin = self._cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.end_headers()
         self.wfile.write(body)
 
-    def _json(self, code: int, obj) -> None:
+    def do_OPTIONS(self):
+        """Preflight. Without this BaseHTTP answers 501 and the browser
+        never sends the real request."""
+        origin = self._cors_origin()
+        if not origin:
+            self.send_response(405)
+            self.send_header("Allow", "GET, POST")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Vary", "Origin")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _json(self, code: int, obj, param: str | None = None) -> None:
+        """Send JSON, upgrading a bare error string to the OpenAI envelope.
+
+        ⚠️ The spec wants `error` to be an OBJECT with message/type/param/
+        code, and both official SDKs assume it. With a bare string:
+
+          openai-python  _client.py unwraps body["error"] to the string,
+                         APIError sees a non-dict, and the user is shown
+                         `Error code: 400 - {'error': "..."}` -- a Python
+                         dict repr.
+          openai-node    `error?.message` is undefined on a string, so it
+                         falls back to JSON.stringify and double-quotes it.
+
+        The messages here are among the better things about this server and
+        both SDKs mangled every one of them. Upgrading centrally rather
+        than at all 17 call sites means no new error site can forget.
+        """
+        if isinstance(obj, dict) and isinstance(obj.get("error"), str):
+            obj = {"error": {
+                "message": obj["error"],
+                "type": "invalid_request_error" if code < 500 else "server_error",
+                "param": param,
+                "code": None,
+            }}
         self._send(code, json.dumps(obj).encode(), "application/json")
 
     def do_GET(self):
         if self.path.rstrip("/") == "/v1/models":
             # Some OpenAI clients list models before their first call.
+            # `created` is required by the spec and non-optional in the
+            # SDK's Model type, so a strict client rejects the response
+            # without it. Fixed: the project's first commit date.
             self._json(200, {"object": "list", "data": [
-                {"id": "drama-3", "object": "model", "owned_by": "fishaudio"}]})
+                {"id": "drama-3", "object": "model",
+                 "created": 1760000000, "owned_by": "fishaudio"}]})
             return
-        if self.path.rstrip("/") == "/v1/voices":
-            # Not in the OpenAI spec, but the shape openedai-speech and
-            # Kokoro-FastAPI use, so clients that look for voices already
-            # know how to read it. Without this a caller has no way to
-            # discover a name short of being told one.
+        if self.path.rstrip("/") == "/v1/audio/voices":
+            # ⚠️ /v1/audio/voices, NOT /v1/voices. Not in the OpenAI spec
+            # either way, but Kokoro-FastAPI serves it under /v1/audio/,
+            # and a client that only tries the conventional path would
+            # find nothing here. This was /v1/voices for a few hours and
+            # was moved rather than aliased: two paths for one resource
+            # is how a "standard" interface quietly stops being one.
+            #
+            # (openedai-speech, named alongside Kokoro when this came up,
+            # turns out to have no voices endpoint at all -- it configures
+            # voices in YAML. The convention rests on Kokoro.)
             eng = self.engine
             names = sorted(eng.voices)
             self._json(200, {"voices": [
@@ -615,7 +701,16 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {**STATE, "uptime_seconds": round(uptime, 1),
                              "rtf": round(rtf, 3) if rtf else None})
         else:
-            self._json(404, {"error": "GET /health or /v1/models; "
+            # 405 + Allow, not 404, when the path exists for another verb.
+            if self.path.rstrip("/") in ("/v1/audio/speech", "/tts",
+                                         "/tts_to_audio"):
+                self.send_response(405)
+                self.send_header("Allow", "POST")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self._json(404, {"error": "GET /health, /v1/models or "
+                                      "/v1/audio/voices; "
                                       "POST /v1/audio/speech or /tts"})
 
     def do_POST(self):
@@ -684,6 +779,25 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, info)
             return
 
+        if route == "/admin/voices/default":
+            try:
+                length = int(self.headers.get("content-length", 0))
+                name = (json.loads(self.rfile.read(length) or b"{}")
+                        .get("name") or "").strip()
+            except Exception as exc:                       # noqa: BLE001
+                self._json(400, {"error": f"bad request: {exc}"})
+                return
+            if name not in self.engine.voices:
+                self._json(400, {"error": f"unknown voice {name!r}; have: "
+                                 f"{', '.join(sorted(self.engine.voices)) or '(none)'}"})
+                return
+            import voices as voicelib
+            voicelib.set_default(name)
+            self.engine.default_voice = name
+            log(f"default voice is now {name!r}")
+            self._json(200, {"default": name})
+            return
+
         if route not in ("/tts", "/tts_to_audio", "/v1/audio/speech"):
             self._json(404, {"error": "POST /v1/audio/speech, /tts or /tts_to_audio"})
             return
@@ -698,19 +812,41 @@ class Handler(BaseHTTPRequestHandler):
                    or payload.get("format")
                    or ("mp3" if openai else "wav")).lower()
             speed = float(payload.get("speed") or 1.0)
-            voice = (payload.get("voice") or "").strip() or None
+            # ⚠️ The spec allows `voice` as a STRING or as an object
+            # {"id": "..."}. The documented object form used to reach
+            # .strip() and 400 with "'dict' object has no attribute
+            # 'strip'" -- a conforming client rejected, and a raw Python
+            # AttributeError leaking into the response body.
+            raw_voice = payload.get("voice")
+            if isinstance(raw_voice, dict):
+                raw_voice = raw_voice.get("id")
+            voice = (str(raw_voice).strip() or None) if raw_voice else None
+            stream_format = payload.get("stream_format")
         except Exception as exc:
-            self._json(400, {"error": f"bad request: {exc}"})
+            # ⚠️ Do not put exception text in the body. It leaks internals
+            # and reads as a server bug when the fault is in the request.
+            log(f"bad request: {type(exc).__name__}: {exc}")
+            self._json(400, {"error": "malformed JSON body"})
+            return
+
+        # ⚠️ Reject rather than ignore. Accepting stream_format="sse" and
+        # returning raw audio is the same silent-bite that `speed` had:
+        # the client asked for one thing, got another, and fails somewhere
+        # less obvious. Only "audio" is implemented.
+        if stream_format not in (None, "audio"):
+            self._json(400, {"error": f"stream_format {stream_format!r} is not "
+                             "supported; this server returns complete audio "
+                             "(stream_format 'audio')"}, "stream_format")
             return
         if not text:
-            self._json(400, {"error": "no text: send 'input' or 'text'"})
+            self._json(400, {"error": "no text: send 'input' or 'text'"}, "input")
             return
         if fmt not in FORMATS:
             self._json(400, {"error": f"unsupported response_format {fmt!r}; "
                                       f"have {', '.join(sorted(FORMATS))}"})
             return
         if not 0.25 <= speed <= 4.0:
-            self._json(400, {"error": f"speed {speed} outside 0.25-4.0"})
+            self._json(400, {"error": f"speed {speed} outside 0.25-4.0"}, "speed")
             return
         # ⚠️ Validate the voice BEFORE taking the GPU lock. An unknown name
         # is the client's typo, answerable in microseconds; discovering it
@@ -719,7 +855,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.engine.pick_voice(voice)
         except ValueError as exc:
-            self._json(400, {"error": str(exc)})
+            self._json(400, {"error": str(exc)}, "voice")
             return
         started = time.perf_counter()
         try:

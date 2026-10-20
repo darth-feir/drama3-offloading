@@ -33,9 +33,21 @@ same clip prefilled live in the same process. The gap sits inside the
 
 ## What a voice is
 
-118 MiB of prefilled state, plus what is needed to decide whether reusing
-it is safe. Four voices is under half a gigabyte against 30 GiB of pinned
-experts — the cost is nothing; the correctness is the whole problem.
+Prefilled state plus what is needed to decide whether reusing it is safe.
+
+⚠️ **It lives in VRAM, not host RAM** — an earlier draft of this note said
+host RAM and was wrong. `voices.load_into()` does `.to(device)`, so every
+loaded voice sits on the card for the life of the process. Measured:
+
+| reference | rows | resident |
+|---|---|---|
+| 28.5 s | 734 | **94 MiB** |
+| 56 s | 1416 | **125 MiB** |
+| 84.5 s | 2120 | **157 MiB** |
+
+About **1.7 MiB per second** of reference. Four 60-second voices is
+~500 MiB of VRAM: small against 24 GB, but not the free lunch "host RAM"
+implied, and a real cost on a smaller card.
 
 **Order is the contract.** A live snapshot holds module references —
 `(module, k, v)` — which cannot be serialised. On reload the tensors are
@@ -98,9 +110,9 @@ it. The client sends no timeout for that reason.
 
 `voice` on `/v1/audio/speech` was *accepted and ignored*; it now selects a
 voice, so the standard field finally means something and no protocol had
-to be invented. `GET /v1/voices` lists them in the shape
-openedai-speech and Kokoro-FastAPI use. `/health` reports them too, so a
-monitor needs one call rather than two.
+to be invented. `/health` reports the voices too, so a monitor needs one
+call rather than two. (The listing endpoint moved after review — see
+*Interfaces, corrected* below.)
 
 ⚠️ **Admin routes are deliberately not under `/v1`.** OpenAI has no
 voice-creation call; putting one in its namespace would tell a client this
@@ -134,6 +146,91 @@ exist because people reach for `--start` before `start`.
 A snapshot is not audio, but it exists solely to reproduce a particular
 person's voice. That is the same personal data in a different format, and
 it is excluded for the same reason `source clips/` and `out/` are.
+
+## How long can a reference clip be?
+
+Three different ceilings; the lowest one binds, and it is not the one the
+arithmetic suggests.
+
+**Measured, with the server at `--vram-reserve 2`:** 56 s works, and
+everything longer fails during the build —
+
+```
+ 56s  →  ok
+ 90s  →  OOM, wanted 456 MiB, 352 MiB free
+112s  →  OOM, wanted 604 MiB
+224s  →  failure inside the TorchScript codec
+336s  →  failure inside the TorchScript codec
+392s  →  OOM, wanted 2.06 GiB
+```
+
+The alternation between codec failure and allocator OOM is not two
+different walls — it is the same shortage surfacing wherever the losing
+allocation happens to be.
+
+⚠️ **The binding limit is VRAM headroom during prefill, not KV capacity.**
+Caches hold 10,240 rows and a reference costs ~24.8 rows/s, which implies
+~385 s — that ceiling is never reached and should not be quoted as one.
+
+**It is a trade, not a fixed number.** The same 90 s clip builds fine once
+the expert cache is smaller:
+
+| `--vram-reserve` | expert cache | free at peak | 90 s clip |
+|---|---|---|---|
+| 2 (default) | 87/layer, 10.2 GiB | ~2.0 GiB | OOM |
+| 5 | 59/layer, 6.9 GiB | ~5.1 GiB | **builds** |
+
+**And the headroom is only needed to BUILD.** A 90 s voice built at
+reserve 5 loads and serves at reserve 2 with ~2 GiB free, because
+restoring a snapshot does not need prefill activations. Build long voices
+with a big reserve once, then run normally.
+
+## Does a longer reference cost anything per request?
+
+Same prompt (the 52-word Dune fixture), two runs each, three voices from
+the same clip:
+
+```
+v30    (734 rows)   rtf 0.783  [0.764-0.801]
+v56   (1416 rows)   rtf 0.783  [0.781-0.786]
+len90 (2120 rows)   rtf 0.831  [0.829-0.833]
+```
+
+**Switching voices costs nothing**, and 28.5 s vs 56 s is identical at
+0.783 despite nearly double the rows — the prefix is restored, not
+re-prefilled, so its length does not enter per-request cost.
+
+**len90 is ~6 % slower and it looks real:** its two runs span 0.004 and
+sit entirely above the other two arms, whose ranges overlap completely.
+At 2120 rows the decode KV length crosses from the 2048 CUDA-graph bucket
+into 4096.
+
+⚠️ n=2 per arm. The *measurement* is consistent; the bucket story is a
+hypothesis, and `11` records a previous bucket explanation in this project
+that was published from two points and contradicted by the third.
+
+⚠️ A `rtf 0.99` figure was quoted for the 90 s voice earlier in the day
+and wondered about as a prefix effect. It was a 40-byte request, where
+fixed overhead dominates. On a real prompt the same voice runs 0.83.
+
+## Interfaces, corrected after review
+
+`GET /v1/audio/voices`, **not** `/v1/voices`. It shipped briefly at the
+latter and was **moved, not aliased** — two paths for one resource is how
+an interface that claims to be standard quietly stops being one.
+
+⚠️ Checked rather than assumed: Kokoro-FastAPI does serve
+`/v1/audio/voices`. **openedai-speech, cited alongside it, has no voices
+endpoint at all** — it configures voices in YAML. The convention rests on
+one implementation, not two.
+
+**`voice` accepts three aliases** — `"drama3"`, `"default"` and `""` —
+all meaning the default, none of them 400. They are load-bearing:
+`drama3ctl config` emits `"voice": "drama3"`, which predates named
+voices, so a client configured before this feature keeps working.
+
+> **What breaks if you change it back:** delete the aliases and the
+> backend block this project hands out starts returning 400.
 
 ## Not done
 

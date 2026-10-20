@@ -33,7 +33,21 @@ Content-Type: application/json
 ```
 
 Returns the audio as the raw response body, with a matching `Content-Type`.
-Errors return JSON: `{"error": "..."}` with 400 or 500.
+**Errors use the OpenAI envelope**, because both official SDKs assume it:
+
+```json
+{"error": {"message": "unknown voice 'nope'; have: narrator",
+           "type": "invalid_request_error", "param": "voice", "code": null}}
+```
+
+`type` is `invalid_request_error` for 4xx and `server_error` for 5xx;
+`param` names the offending field when there is one.
+
+⚠️ This was a bare string (`{"error": "..."}`) until 2026-10-20, and both
+SDKs mangled it: openai-python showed `Error code: 400 - {'error': "..."}`
+— a Python dict repr — and openai-node fell through to `JSON.stringify`
+because `error?.message` is undefined on a string. The messages are the
+useful part of this API and neither SDK could display one.
 
 | field | required | notes |
 |---|---|---|
@@ -41,13 +55,27 @@ Errors return JSON: `{"error": "..."}` with 400 or 500.
 | `response_format` | no | `wav` `mp3` `flac` `opus` `aac` `pcm`. **Defaults to `mp3`**, per the OpenAI spec |
 | `model` | no | accepted and ignored; one model per process |
 | `voice` | no | **a registered voice name.** Omit for the default. An unknown name is a `400` naming what exists |
+| `voice` aliases | — | `"drama3"`, `"default"` and `""` all mean *the default voice* and never 400 |
+| `voice` object | — | the spec's `{"id": "narrator"}` form is accepted as well as a plain string |
+| `stream_format` | no | only `"audio"`. **`"sse"` is a 400**, not silently ignored |
 
-`GET /v1/voices` lists them — the shape openedai-speech and Kokoro-FastAPI
-use, so a client that already discovers voices needs no new code:
+⚠️ **The aliases are deliberate, not dead code.** `drama3ctl config`
+emits `"voice": "drama3"` in its backend block, and that value predates
+named voices — so a client configured before voices existed keeps working
+unchanged. Delete them and you break the config this project hands out.
+
+`GET /v1/audio/voices` lists the real ones:
 
 ```json
 {"voices": [{"id": "narrator", "default": true}]}
 ```
+
+⚠️ Note the path: **`/v1/audio/voices`**, not `/v1/voices`. Neither is in
+the OpenAI spec, but Kokoro-FastAPI serves it under `/v1/audio/`, and a
+client that tries only the conventional path would otherwise find
+nothing. This endpoint was `/v1/voices` briefly and was **moved rather
+than aliased** — two paths for one resource is how an interface that
+claims to be standard quietly stops being one.
 | `speed` | no | **honoured.** `0.25`–`4.0`, default `1.0`. Outside that range is a `400`, not a clamp |
 
 **`speed` is a real post-process**, not a hint: ffmpeg `atempo` with pitch
@@ -67,6 +95,17 @@ there is nothing for a client to misconfigure.
 ⚠️ **If you choose `pcm`, it is headerless 16-bit little-endian mono at
 44100 Hz.** Nothing in the stream says so. A client that assumes 22050 will
 play it at half speed with no error.
+
+## Browsers: CORS is off by default
+
+Set `DRAMA3_CORS` to an origin (or `*`) to enable it. Without it a
+browser page cannot call this server at all — preflight gets a 405.
+
+⚠️ **CORS headers are never sent on `/admin/*`, by design.** This server
+has no authentication, and `/admin/voices` can delete a voice or build
+one from a server-side path. With `Access-Control-Allow-Origin: *` on
+those routes, any page you happened to visit could administer your
+server. Prefer a specific origin over `*`.
 
 ## GET /v1/models
 
