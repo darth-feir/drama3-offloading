@@ -113,6 +113,14 @@ word-similarity  median 1.000  mean 0.980
 **Every chunk below 0.95 is the scorer or the ASR, not the model.** Checked
 individually:
 
+⚠️ **Corrected 2026-10-19.** That conclusion was reached by scoring whole
+chunks, and length dilutes — a bad piece inside a long chunk is hidden by
+the good ones around it. Scoring per piece on the same document later found
+real failures: a dropped trailing heading, two substituted sentences and
+one passage of outright gibberish. See `15-gibberish-and-the-content-check.md`.
+The table below is still accurate about what it measured; it measured the
+wrong unit.
+
 | chunk | source | STT heard | what it is |
 |---|---|---|---|
 | 210 | `1.` | "One." | model read the numeral aloud, correctly; word-level diff scores 0.00 |

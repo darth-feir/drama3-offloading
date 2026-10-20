@@ -1,0 +1,44 @@
+# Exact versions of the venv every measurement in this repo was taken on.
+#
+#   venv/bin/pip install -r requirements.txt
+#
+# WHY PIN AT ALL
+# --------------
+# Three of these have already broken this project by floating:
+#   torch         unpinned resolves to 2.14.1+cu130; fish-speech pins 2.8.0
+#                 in five places. 2.14 works and is the same steady-state
+#                 speed, but graph capture goes 2.5 s -> 55-82 s.
+#   transformers  unpinned resolved to 5.20.2 against fish-speech's ==5.19.0
+#   tokenizers    unpinned resolved to 0.23.3 against its ==0.23.2
+# The remaining ten were floating for the same reason the first three were,
+# which is that nobody had been bitten by them yet.
+#
+# This is a known-good set, not a minimal or a maximal one. Newer almost
+# certainly works; this is what the numbers in README.md and notes/ mean.
+
+torch==2.8.0
+torchaudio==2.8.0
+triton==3.4.0
+
+numpy==2.5.4
+soundfile==0.14.0
+loguru==0.7.3
+tqdm==4.70.1
+einops==0.8.2
+
+safetensors==0.8.0
+hydra-core==1.3.7
+transformers==5.19.0
+tokenizers==0.23.2
+huggingface-hub==1.33.0
+descript-audio-codec==1.0.0
+
+# ⚠️ torchcodec is NOT here on purpose, and the README's install list
+# mentions it only as a conditional. torchaudio.load() routes through it
+# from torch 2.9 onwards; at the 2.8.0 pinned above it is unused, and it
+# is genuinely absent from the venv these versions were read from. If you
+# move off the pin to 2.9+, you need it -- and it needs libavcodec on
+# LD_LIBRARY_PATH, which is its own afternoon.
+#
+# fish-speech itself is NOT here either: it is installed from a checkout
+# with --no-deps. See README.md Setup.

@@ -24,12 +24,20 @@ export DRAMA3_VENV
 # a 1.87 GiB codec; licence is Fish Audio Research, non-commercial.
 #   export DRAMA3_CKPT=/path/to/models--fishaudio--drama-3/snapshots/<hash>
 #
-# A speech-to-text unix socket: write an absolute wav path, read one line of
-# text. Used to transcribe the reference clip and to score output. Without
-# it, pass --ref-text yourself -- which is the better choice for a long
-# reference anyway, since ASR errors in the transcript are inherited by
-# every chunk of the document.
-#   export DRAMA3_STT=/run/user/1000/stt.sock
+# Speech-to-text, for the content check that catches gibberish and for
+# transcribing the reference clip. Either an OpenAI-compatible server or a
+# unix socket; see bin/paths.py.
+#   export DRAMA3_STT=http://127.0.0.1:8080      # /v1/audio/transcriptions
+#   export DRAMA3_STT=/run/user/1000/stt.sock    # bespoke, see paths.py
+# Without it, pass --ref-text yourself. ⚠️ This used to claim ASR errors
+# were "inherited by every chunk"; that was asserted, never measured, and
+# the measurement did not support it -- see notes/17. A transcript of the
+# single word "placeholder" against 56 s of unrelated speech cost nothing
+# detectable in timbre or content. It did speak ~8 % slower.
+#
+# Where the compiled CUDA extension is cached. Defaults to
+# torch-ext-cache/ beside the code, which needs a WRITABLE checkout:
+#   export DRAMA3_EXT_CACHE=/var/tmp/drama3-ext
 #
 # Toolchain for building csrc/fetch_experts.cu, if discovery guesses wrong:
 #   export DRAMA3_CUDA_HOME=/usr/local/cuda   # needs bin/nvcc AND include/
@@ -55,6 +63,37 @@ if [ -e /etc/NIXOS ] || [ -d /run/opengl-driver/lib ]; then
         [ -d "$_ff" ] && export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$_ff"
     done
     unset _ff
+
+    # ⚠️ libstdc++.so.6. torch's own _C extension needs it, and a venv
+    # built from a NIX-STORE python cannot find it: `import torch` dies
+    # with "ImportError: libstdc++.so.6: cannot open shared object file"
+    # from inside torch/__init__.py.
+    #
+    # This went undetected for the life of the project because the author's
+    # venv is built on a UV-MANAGED CPython. That is a foreign binary, so
+    # NixOS's programs.nix-ld fires and supplies libstdc++ transparently.
+    # A nix-store python uses the nix loader, nix-ld never applies, and the
+    # documented setup fails on the only machine this has ever run on.
+    #
+    # ⚠️ `nix-shell -p gcc` does NOT fix this -- verified. The compiler's
+    # own lib output is not on the runtime loader path, so the obvious
+    # guess wastes an hour.
+    for _d in /nix/store/*-gcc-*-lib/lib; do
+        [ -e "$_d/libstdc++.so.6" ] || continue
+        case "$_d" in *mingw*) continue ;; esac   # matches the glob, wrong libc
+        _v=$(printf '%s' "$_d" | sed -n 's|.*-gcc-\([0-9.]*\)-lib/lib$|\1|p')
+        [ -n "$_v" ] || continue
+        if [ -z "${_bestv:-}" ] || \
+           [ "$(printf '%s\n%s\n' "$_bestv" "$_v" | sort -V | tail -1)" = "$_v" ]; then
+            _bestv="$_v"; _best="$_d"
+        fi
+    done
+    if [ -n "${_best:-}" ]; then
+        export LD_LIBRARY_PATH="$_best${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    else
+        echo "env.sh: no libstdc++.so.6 found in /nix/store; torch will not import" >&2
+    fi
+    unset _d _v _best _bestv
 
     # triton HARDCODES /sbin/ldconfig, which does not exist on NixOS, and
     # dies with FileNotFoundError. This knob is checked BEFORE that call, so

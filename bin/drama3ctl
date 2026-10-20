@@ -7,9 +7,10 @@
 # Configure it by exporting these before `start`, or by editing run/config:
 #
 #   DRAMA3_REF        reference clip (required)
-#   DRAMA3_REF_TEXT   its transcript. Strongly recommended: ASR errors in
-#                     the reference are inherited by every paragraph the
-#                     server ever speaks.
+#   DRAMA3_REF_TEXT   its transcript. Recommended, but less critical than
+#                     this once claimed: a wrong transcript measured no
+#                     worse on timbre or content, only ~8 % slower. See
+#                     notes/17.
 #   DRAMA3_PORT       default 8123
 #
 # ⚠️ Liveness is tracked with a PID FILE, never by matching command-line
@@ -24,8 +25,25 @@ cd "$REPO"
 RUN="${DRAMA3_RUN:-$REPO/run}"
 PIDFILE="$RUN/server.pid"
 LOGFILE="$RUN/server.log"
-PORT="${DRAMA3_PORT:-8123}"
-HOST="${DRAMA3_HOST:-127.0.0.1}"
+# ⚠️ Deliberately EMPTY when unset, not defaulted to 8123/127.0.0.1.
+# These are only passed to the server if the user actually set them; the
+# config file is what decides otherwise. Defaulting here and passing the
+# default as a flag is what used to override `[server] port` in
+# config.toml without saying so.
+PORT="${DRAMA3_PORT:-}"
+HOST="${DRAMA3_HOST:-}"
+
+# Where the running server says it bound. Falls back to the documented
+# default only when there is nothing to read -- that is a guess, and it is
+# used only to print a hint before the server exists.
+URLFILE="$RUN/server.url"
+base_url() {
+    if [ -s "$URLFILE" ]; then
+        tr -d "[:space:]" < "$URLFILE"
+    else
+        echo "http://${HOST:-127.0.0.1}:${PORT:-8123}"
+    fi
+}
 mkdir -p "$RUN"
 
 alive() {  # alive <pid>
@@ -40,25 +58,39 @@ current_pid() {
 }
 
 health() {
-    curl -fsS --max-time 3 "http://$HOST:$PORT/health" 2>/dev/null
+    curl -fsS --max-time 3 "$(base_url)/health" 2>/dev/null
 }
 
 cmd_start() {
     local pid
     if pid="$(current_pid)"; then
-        echo "already running (pid $pid) on http://$HOST:$PORT"
+        echo "already running (pid $pid) on $(base_url)"
         return 0
     fi
-    [ -n "${DRAMA3_REF:-}" ] || {
-        echo "DRAMA3_REF is unset -- point it at a 30-60 s clip of one voice" >&2
-        return 1
-    }
-    [ -r "$DRAMA3_REF" ] || { echo "cannot read DRAMA3_REF=$DRAMA3_REF" >&2; return 1; }
-
-    local args=(--ref "$DRAMA3_REF" --host "$HOST" --port "$PORT" --state-dir "$RUN")
+    # ⚠️ Do NOT re-validate the reference here. config.toml documents
+    # `voice.ref` as the way to set it, and this used to demand
+    # DRAMA3_REF anyway -- so following the documentation produced
+    # "DRAMA3_REF is unset" and the only way to find out why was to read
+    # this file. A launcher that disagrees with the config format it ships
+    # is worse than one that does no checking at all.
+    #
+    # server.py resolves flag -> env -> config and refuses with a message
+    # naming both, before it loads the model, so a bad setup still fails
+    # in a second rather than in forty.
+    local args=(--state-dir "$RUN")
+    [ -n "$HOST" ] && args+=(--host "$HOST")
+    [ -n "$PORT" ] && args+=(--port "$PORT")
+    [ -n "${DRAMA3_REF:-}" ] && args+=(--ref "$DRAMA3_REF")
     [ -n "${DRAMA3_REF_TEXT:-}" ] && args+=(--ref-text "$DRAMA3_REF_TEXT")
     args+=("$@")
 
+    # ⚠️ Rotate, do not truncate. Truncating on start destroyed the evidence
+    # from an A/B run the moment the second arm started -- the retry detail
+    # that the whole experiment existed to collect.
+    # A crash leaves server.url behind; clear it so base_url() cannot
+    # report a port that died with the last process.
+    rm -f "$URLFILE"
+    [ -s "$LOGFILE" ] && mv "$LOGFILE" "$LOGFILE.$(date +%Y%m%d-%H%M%S)"
     : > "$LOGFILE"
     # setsid so it survives this shell; bin/run.sh handles the nix-shell and
     # the environment.
@@ -91,6 +123,10 @@ cmd_start() {
 
 cmd_stop() {
     local pid
+    # ⚠️ Clear the URL on EVERY stop path, including "was not running".
+    # The server removes it on clean shutdown, but a SIGKILL or a crash
+    # leaves it behind, and a stale URL reads as a live server.
+    rm -f "$URLFILE"
     pid="$(current_pid)" || { echo "not running"; rm -f "$PIDFILE"; return 0; }
     # setsid made it a process group leader, so signal the group: bin/run.sh
     # execs through nix-shell, and killing only the pid can orphan python
@@ -110,31 +146,59 @@ cmd_stop() {
 cmd_status() {
     local pid
     if pid="$(current_pid)"; then
-        echo "running  pid $pid  http://$HOST:$PORT"
+        echo "running  pid $pid  $(base_url)"
         local h; h="$(health)"
         [ -n "$h" ] && echo "health   $h" || echo "health   NOT RESPONDING (still loading?)"
     else
         echo "stopped"
         [ -f "$PIDFILE" ] && echo "  (stale pidfile removed)" && rm -f "$PIDFILE"
     fi
+    # Labelled "whole GPU" because it is: this is every process on the
+    # card, not ours. Right after `stop` it can still read ~22 GiB while
+    # the driver reclaims, which looks exactly like a leak and is not.
     command -v nvidia-smi >/dev/null && \
-        echo "vram     $(nvidia-smi --query-gpu=memory.used --format=csv,noheader)"
+        echo "vram     $(nvidia-smi --query-gpu=memory.used --format=csv,noheader) (whole GPU)"
+    # Exit 3 for "not running", after systemctl is-active. Returning 0
+    # either way made `drama3ctl status && ...` always fire, so this is
+    # only useful to a human reading it.
+    current_pid >/dev/null || return 3
+    return 0
 }
 
 cmd_hint() {
+    # Bare JSON on stdout so it pipes into whatever consumes a backend
+    # entry; prose goes to stderr so it stays out of the pipe.
+    #
+    # kind "openai" rather than a hand-written body template: this server
+    # answers POST /v1/audio/speech, which is the nearest thing TTS has to a
+    # common protocol. A generic HTTP escape hatch would work too, but there
+    # is no reason to make a client special-case us.
+    #
+    # format wav, not pcm: a wav header carries its own sample rate, so
+    # there is nothing for a client to misconfigure. Headerless PCM at
+    # 44.1 kHz played as 22.05 kHz is the classic way to get half-speed
+    # audio and no error message.
+    #
+    # concurrency 1 is not a preference. One model on one GPU serialises
+    # internally, so two requests in flight do not finish sooner -- they
+    # interleave and both finish later. prefetch is the knob that hides
+    # latency; concurrency is the one that destroys it.
+    cat >&2 <<EOF
+This server answers the OpenAI speech API at $(base_url)/v1/audio/speech
+See API.md for the full interface. The JSON on stdout is a ready-made
+backend entry for a client that accepts one.
+EOF
     cat <<EOF
-Point say at it by adding a backend to say's config:
-
-  "drama3": {
-    "kind": "http",
-    "url":  "http://$HOST:$PORT",
-    "path": "/tts",
-    "body": "{\\"text\\":\\"{{text}}\\"}",
-    "format": "wav",
-    "rate": 44100
-  }
-
-then:  say -engine drama3 DOC.txt
+{
+  "kind": "openai",
+  "url": "$(base_url)",
+  "model": "drama-3",
+  "voice": "drama3",
+  "format": "wav",
+  "rate": 44100,
+  "concurrency": 1,
+  "prefetch": 3
+}
 EOF
 }
 
@@ -143,8 +207,15 @@ case "${1:-}" in
     stop)    cmd_stop ;;
     restart) cmd_stop; shift; [ "${1:-}" = "--" ] && shift; cmd_start "$@" ;;
     status)  cmd_status ;;
-    log)     tail -f "$LOGFILE" ;;
+    # ⚠️ Does NOT follow by default. It used to be `tail -f`, which blocks
+    # forever -- fine interactively, a hang anywhere else. It cost a
+    # scripted clean-room run ten minutes of wall clock. Ask for -f.
+    log)     shift
+             if [ "${1:-}" = "-f" ]; then tail -f "$LOGFILE"
+             else tail -n "${1:-200}" "$LOGFILE"; fi ;;
     config)  cmd_hint ;;
-    *)       echo "usage: $(basename "$0") start|stop|restart|status|log|config" >&2
+    *)       { echo "usage: $(basename "$0") start|stop|restart|status|config"
+               echo "       $(basename "$0") log [N|-f]   last N lines (200), -f to follow"
+               echo "status exits 3 when not running."; } >&2
              exit 2 ;;
 esac

@@ -36,6 +36,7 @@ requirement -- which removes the need to rewrite pin_experts for Stage 1.
 """
 from __future__ import annotations
 
+import sys as _sys
 import torch
 import triton
 import triton.language as tl
@@ -188,6 +189,7 @@ BLOCK = 4096
 # slow, whereas Triton's depends on a JIT-attached alignment hint that can
 # silently evaporate.
 FETCH_BACKEND = "triton"
+_CPP_WARNED = False
 CPP_BLOCKS_PER_JOB = 64
 _dev_ptr_cache: dict[int, int] = {}
 
@@ -235,8 +237,18 @@ def dev_resolve_and_fetch(experts, topk_ids: torch.Tensor) -> torch.Tensor:
         experts._dc_nmiss, experts._dc_step,
         K=k, C=experts._dc_cap, num_warps=1,
     )
-    if FETCH_BACKEND == "cpp" and _cpp_fetch(experts, k):
-        return experts._dc_out[:k]
+    if FETCH_BACKEND == "cpp":
+        if _cpp_fetch(experts, k):
+            return experts._dc_out[:k]
+        # ⚠️ Say so, ONCE. This used to fall through to Triton without a
+        # word: you asked for cpp, you got triton, and the only evidence
+        # was a speed difference you had nothing to compare against.
+        global _CPP_WARNED
+        if not _CPP_WARNED:
+            _CPP_WARNED = True
+            import cppfetch
+            print(f"cpp fetch unavailable, using triton: "
+                  f"{cppfetch.last_error()}", file=_sys.stderr, flush=True)
     for host, cache in _copy_pairs(experts):
         _triton_fetch_one(experts, host, cache,
                           host.numel() // experts.num_experts, k)

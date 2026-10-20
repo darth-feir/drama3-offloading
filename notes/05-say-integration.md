@@ -121,10 +121,26 @@ the real `~/.config`.
 `bin/drama3ctl start|stop|restart|status|log|config`. One model load, many
 requests; `drama3ctl config` prints the exact `say` backend block.
 
-`say`'s `http` kind POSTs a templated JSON body and expects **raw audio
-bytes** back, reading the sample rate from the wav header (`rest.go`). So
-`POST /tts {"text": ...}` returns 44.1 kHz mono PCM_16. `voice` and `speed`
-are accepted and ignored, so a stock config template works unmodified.
+⚠️ **Superseded.** This originally described wiring `say` up through its
+generic `http` kind with a hand-written body template. That was the wrong
+shape and the fault was ours, not say's.
+
+say already has an `openai` backend, and its own comment explains why:
+
+> speaks POST {url}/v1/audio/speech, which is the closest thing TTS has to
+> a common language: OpenAI, Kokoro-FastAPI, dots.tts, openedai-speech,
+> LocalAI and Orpheus all answer it, so they are all this one backend with
+> different config.
+
+Six engines already use the standard path. The only reason this one did not
+is that it answered a bespoke `/tts` and nothing else, so a client had to be
+told our shape. **The server now speaks `POST /v1/audio/speech`** and needs
+no special handling from anything. See `API.md`.
+
+What is left for a client to know is in `API.md`, not here — the short
+version being that requests serialise (concurrency 1, prefetch higher),
+there is no streaming so timeouts want to be generous, and `wav` is
+preferable to `pcm` because the header carries the sample rate.
 
 Measured on the first real request: **7.38 s of audio in 6.68 s, RTF 0.905.**
 

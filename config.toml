@@ -1,0 +1,146 @@
+# Drama 3 server configuration.
+#
+#   bin/drama3ctl start                 # reads ./config.toml
+#   bin/run.sh bin/server.py --config /path/to/other.toml
+#
+# Every value here is also a command-line flag, and the flag wins. Anything
+# you leave out falls back to the default shown in the comment.
+#
+# The numbers are not arbitrary — where one was measured, the measurement is
+# written next to it. If you change one, the comment tells you what you are
+# trading away.
+
+[voice]
+# A 30–60 s clip of ONE person speaking cleanly. Required.
+# ref = "/path/to/clip.mp3"
+
+# The transcript of that clip. Strongly recommended over leaving it to STT:
+# an ASR error here is inherited by every paragraph the server ever speaks.
+# At 28 s that is survivable; at 200 s it is not.
+# ref_text = "exactly what the clip says"
+
+# Seconds of the clip to use. Measured by ear: 20 s "bad", 28 s "no longer a
+# different voice", 56 s "the best sounding so far by far". Longer is better
+# and — since --prefix-kv — costs nothing per request, only at startup.
+seconds = 56.0
+
+# Cut at a silence rather than mid-word. A hard cut through speech gives the
+# model a chopped-off word as its only example of what audio looks like
+# before end-of-speech, and the voice audibly drifts.
+snap_to_silence = true
+
+
+[sampling]
+# ⚠️ top_p 0.9, not the 0.7 upstream ships. fish-speech's nucleus filter
+# drops the token that CROSSES the threshold, and at 0.7 that made EOS
+# unreachable: measured 0 draws in 4000 at every temperature. Generations
+# ran to the length cap and filled with silence. Do not lower this without
+# reading notes/08-STATE-AND-NEXT.md.
+temperature = 1.0
+top_p = 0.9
+top_k = 4097          # 4097 = eos + every semantic code, i.e. uncapped
+
+
+[splitting]
+# Paragraphs longer than this are split INTERNALLY for generation and the
+# audio is concatenated. The caller's text is never altered — with `say` it
+# is the cache key, and here it is the request body.
+#
+# Why split at all: say's chunker joins a trailing heading onto the previous
+# paragraph, which is the exact shape Drama 3 drops content on.
+para_max_bytes = 400
+
+# Frames per generation. 600 frames = 27.9 s of audio at 21.53 Hz.
+max_new_tokens = 600
+
+
+# ─────────────────────────── quality checks ───────────────────────────
+# Each is independently switchable. They run in the order listed and a
+# failure triggers a retry, up to max_attempts; after that the BEST draw is
+# delivered anyway, because an imperfect paragraph beats a hole in the
+# audiobook. Giving up is logged and counted in /health.
+
+[checks]
+max_attempts = 3
+
+
+[checks.duration]
+# Cheap first filter: does the audio last roughly as long as the text
+# implies? Catches a draw that stopped early or babbled for 3x too long.
+enabled = true
+min_ratio = 0.55
+max_ratio = 2.2
+# Below this many seconds of expected audio the ratio is too noisy to judge.
+min_seconds = 1.5
+
+
+[checks.content]
+# ⚠️ The expensive one, and the only one that catches GIBBERISH.
+#
+# A bad draw speaks nonsense for about as long as the real words take, so
+# the duration check passes it on the first attempt and never retries.
+# Observed on a novel: "der pausbomwerk denisian" in place of "their world",
+# at a perfectly healthy 16.2 chars/second.
+#
+# This transcribes each generated piece and compares it to the text it was
+# given. Needs DRAMA3_STT pointing at a speech-to-text socket; without one
+# it silently does nothing and you keep duration-only behaviour.
+#
+# COST, measured over 170 paragraphs of a technical document:
+#   the STT calls      0.26 s per piece, 3.0 % of runtime
+#   the retries        9 fired, ~4.5 %
+#   total              RTF 0.798 -> 0.884, about 11 %
+#
+# ⚠️ Those retries were REAL, checked one by one. The suspicion that they
+# were false positives from STT mangling jargon (BACPAC -> "backpack") was
+# wrong — the actual failures were a dropped trailing heading, two
+# substituted sentences, and "sendoi shrueling report cat Sego and XC when
+# it tofund Azure Compare." Every one recovered within 3 attempts.
+#
+# ⚠️ And the earlier "0/235 content loss" measured on this same document
+# was optimistic: it scored whole chunks, where a bad piece is diluted by
+# the good ones around it. The failures were always there.
+enabled = true
+
+# Good audio scores ~0.95 (STT normalises numbers and mangles proper nouns,
+# so it never reaches 1.00). The gibberish above scored 0.04 and 0.49 with
+# tail weighting. 0.75 separates them with room on both sides.
+min_similarity = 0.75
+
+# Below this many words, similarity is noise. The 8-byte warm-up text
+# "Warm up." scored 0.44 and triggered a pointless regeneration.
+min_words = 8
+
+# Score the last quarter separately and take the WORSE of the two.
+# Similarity over a whole piece is diluted by length: a 196-word chunk with
+# clear gibberish in it still scored 0.87 overall, and 0.49 on its tail.
+# The failure lives at the end, which is where to look.
+tail_fraction = 0.25
+
+
+# ─────────────────────── post-processing ───────────────────────
+
+[post.trim_trailing_silence]
+# Cut dead air after the last word. A 196-byte paragraph once spoke for 10 s
+# then emitted 17.9 s of silence.
+enabled = true
+pad_seconds = 0.15
+
+
+[post.clamp_internal_silence]
+# Shorten gaps INSIDE a paragraph. Measured on a 32-minute narration: 104
+# gaps of >= 0.6 s totalling 134.8 s — 7 % of the file was dead air.
+#
+# ⚠️ Not a flat cap. A pause at an em dash or semicolon is performance, and
+# flattening it to max_gap makes the reading worse. The clamp works on AUDIO
+# while the punctuation is in TEXT and there is no alignment between them,
+# so instead it counts the pause-worthy marks and lets that many of the
+# longest gaps keep up to long_gap.
+enabled = true
+max_gap = 0.5         # ordinary silence
+long_gap = 1.2        # a gap that punctuation has earned
+
+
+[server]
+host = "127.0.0.1"
+port = 8123

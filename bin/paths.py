@@ -69,23 +69,44 @@ def checkpoint() -> Path:
                 return entry
     raise SystemExit(
         "cannot find the Drama 3 weights.\n"
-        "  huggingface-cli download fishaudio/drama-3\n"
+        "  hf download fishaudio/drama-3   # huggingface-cli in hub < 1.0\n"
         "  export DRAMA3_CKPT=/path/to/snapshots/<hash>\n"
         "36.9 GiB of weights plus a 1.87 GiB codec. Licence: Fish Audio\n"
         "Research, non-commercial -- this repo ships no weights."
     )
 
 
-def stt_socket() -> str | None:
-    """A speech-to-text socket, or None. Optional on purpose.
+def stt_endpoint() -> str | None:
+    """Where to send audio for transcription, or None. Optional on purpose.
 
-    The original setup had a resident Parakeet daemon on a fixed path. Here
-    it is opt-in: without it the reference transcript must be supplied with
-    --ref-text, which is what you want for a long clip anyway because ASR
-    errors in the reference are inherited by every chunk of the document.
+    Two shapes are accepted, because one of them is portable and the other
+    is what this was developed against:
+
+      http://host:port    an OpenAI-compatible server -- POST
+                          /v1/audio/transcriptions. whisper.cpp's server,
+                          faster-whisper-server, LocalAI, openedai-whisper
+                          and OpenAI all answer it.
+      /path/to/sock       a unix socket speaking "write an absolute wav
+                          path, read one line of text".
+
+    ⚠️ The socket form is bespoke. It exists because the machine this was
+    built on already had a resident Parakeet daemon with that protocol, and
+    keeping it costs nothing -- but nobody else has one, so the HTTP form is
+    the one to document.
+
+    Without either, the content check silently does nothing and the
+    reference transcript must be supplied with --ref-text.
     """
-    sock = os.environ.get("DRAMA3_STT")
-    return sock if sock and Path(sock).exists() else None
+    value = os.environ.get("DRAMA3_STT")
+    if not value:
+        return None
+    if value.startswith(("http://", "https://")):
+        return value
+    return value if Path(value).exists() else None
+
+
+# Older name, kept so nothing breaks.
+stt_socket = stt_endpoint
 
 
 def install() -> Path:

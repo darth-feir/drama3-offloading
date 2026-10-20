@@ -34,10 +34,25 @@ def _which(name: str, nix_glob: str) -> str:
     return os.path.dirname(hits[0]) if hits else ""
 
 
+# ⚠️ Declared here as well as assigned in _resolve(). They used to exist
+# only once _resolve() had run, so any reader that ran first died with
+# NameError rather than seeing an empty string meaning "not found".
+CUDA_MERGED: str = ""
+GCC14_BIN: str = ""
+NINJA_BIN: str = ""
+
+
 def _resolve() -> None:
     global GCC14_BIN, NINJA_BIN, CUDA_MERGED
     import glob
+    # ⚠️ Verify the override instead of trusting it. This used to accept
+    # DRAMA3_CUDA_HOME pointing anywhere -- including a directory with no
+    # nvcc in it -- while the /usr/local/cuda branch below did check. The
+    # result was doctor.py cheerfully reporting a toolchain that was not
+    # there.
     CUDA_MERGED = os.environ.get("DRAMA3_CUDA_HOME", "")
+    if CUDA_MERGED and not os.path.isfile(os.path.join(CUDA_MERGED, "bin", "nvcc")):
+        CUDA_MERGED = ""
     if not CUDA_MERGED:
         nvcc = _which("nvcc", "/nix/store/*cuda-merged*/bin/nvcc")
         CUDA_MERGED = os.path.dirname(nvcc) if nvcc else ""
@@ -103,9 +118,14 @@ def nvcc_env():
         # killed build makes it worse.
         import torch as _t
         tag = f"{_t.__version__}-py{sys.version_info.major}{sys.version_info.minor}"
-        os.environ.setdefault(
-            "TORCH_EXTENSIONS_DIR",
-            str(Path(__file__).resolve().parent.parent / "torch-ext-cache" / tag))
+        # DRAMA3_EXT_CACHE so a read-only checkout can still build. The
+        # default puts it next to the code, which is convenient until the
+        # clone is not writable and the failure is a build error rather
+        # than anything naming the cause.
+        root = os.environ.get(
+            "DRAMA3_EXT_CACHE",
+            str(Path(__file__).resolve().parent.parent / "torch-ext-cache"))
+        os.environ.setdefault("TORCH_EXTENSIONS_DIR", str(Path(root) / tag))
         os.environ["PATH"] = ":".join(
             p for p in (os.path.join(CUDA_MERGED, "bin"), NINJA_BIN, GCC14_BIN,
                         os.environ.get("PATH", "")) if p)
@@ -130,6 +150,21 @@ def load(verbose: bool = False):
     src = Path(__file__).resolve().parent.parent / "csrc" / "fetch_experts.cu"
     if not src.is_file():
         _err = f"missing {src}"
+        return None
+    # ⚠️ Name the missing tool and the way out. Discovery is PATH, then a
+    # Nix-store glob, then /usr/local/cuda -- so on NixOS this succeeds or
+    # fails according to what the store happens to contain, which is not
+    # something the user chose or can see. Without this they get a
+    # cpp_extension error about CUDA_HOME, or (worse) the silent Triton
+    # fallback in devcache._fetch.
+    _resolve()          # nvcc_env() would do this, but not until later
+    missing = [n for n, v in (("nvcc", CUDA_MERGED), ("ninja", NINJA_BIN))
+               if not v]
+    if missing:
+        _err = (f"no {' or '.join(missing)} found "
+                f"(PATH, /nix/store, /usr/local/cuda). "
+                f"Use --fetch-backend triton, which needs no compiler, "
+                f"or set DRAMA3_CUDA_HOME / DRAMA3_CXX.")
         return None
     try:
         with nvcc_env():

@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse, json, os, re, socket, subprocess, sys, time, traceback
 from pathlib import Path
 
+import config  # config.toml; see bin/config.py
 import paths  # resolves DRAMA3_FISH / DRAMA3_CKPT; see bin/paths.py
 FISH = paths.install()
 
@@ -266,24 +267,92 @@ def to_pcm16(src: Path, dst: Path, seconds: float | None) -> None:
 
 
 def transcribe(path: Path) -> str:
+    """Audio in, text out. Never raises -- STT is a check, not the product.
+
+    DRAMA3_STT selects the backend; see paths.stt_endpoint(). An
+    http(s) value goes to an OpenAI-compatible /v1/audio/transcriptions,
+    which is what a portable install should use. A filesystem path is
+    treated as a unix socket speaking the bespoke "write a path, read a
+    line" protocol this was originally built against.
+
+    Returns a "<stt ...>" string rather than throwing, so a caller can log
+    it and carry on. Everything that uses this treats an unparseable answer
+    as "no opinion", not as a failure.
+    """
+    endpoint = paths.stt_endpoint()
+    if endpoint is None:
+        return ("<stt unavailable: set DRAMA3_STT to an OpenAI-compatible "
+                "URL or a socket path, or pass --ref-text>")
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock = paths.stt_socket()
-        if sock is None:
-            return ("<stt unavailable: set DRAMA3_STT to a socket, "
-                    "or pass --ref-text>")
-        s.connect(sock)
+        if endpoint.startswith(("http://", "https://")):
+            return _transcribe_http(path, endpoint)
+        return _transcribe_socket(path, endpoint)
+    except Exception as exc:                   # a check, never fatal
+        return f"<stt failed: {exc}>"
+
+
+def _transcribe_http(path: Path, base: str) -> str:
+    """POST /v1/audio/transcriptions, multipart, as OpenAI defines it.
+
+    Hand-rolled multipart because `requests` is not a dependency here and
+    adding one for twenty lines would be a poor trade.
+    """
+    import mimetypes, urllib.request, uuid
+    url = base.rstrip("/")
+    if not url.endswith("/v1/audio/transcriptions"):
+        url += "/v1/audio/transcriptions"
+    boundary = uuid.uuid4().hex
+    ctype = mimetypes.guess_type(path.name)[0] or "audio/wav"
+    body = b"".join([
+        f'--{boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n'
+        f'whisper-1\r\n'.encode(),
+        # ⚠️ json, not text. The OpenAI spec lists five response formats and
+        # real servers implement subsets -- faster-whisper-server 0.0.3
+        # answers a flat "400 Unsupported response_format: text". json is
+        # the one every implementation has.
+        f'--{boundary}\r\nContent-Disposition: form-data; name="response_format"'
+        f'\r\n\r\njson\r\n'.encode(),
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+        f'filename="{path.name}"\r\nContent-Type: {ctype}\r\n\r\n'.encode(),
+        path.read_bytes(), b"\r\n",
+        f"--{boundary}--\r\n".encode(),
+    ])
+    request = urllib.request.Request(
+        url, data=body,
+        headers={"content-type": f"multipart/form-data; boundary={boundary}"})
+    raw = urllib.request.urlopen(request, timeout=120).read().decode().strip()
+    # response_format=text gives bare text; some servers answer JSON anyway.
+    if raw.startswith("{"):
+        import json
+        return str(json.loads(raw).get("text", "")).strip()
+    return raw
+
+
+def _transcribe_socket(path: Path, sock_path: str) -> str:
+    """Write an absolute wav path, read one line back.
+
+    ⚠️ Three traps, all of which return EMPTY rather than erroring, and all
+    of which look exactly like the model having produced silence:
+      - a daemon with PrivateTmp=true cannot see a wav under /tmp
+      - it may read PCM_16 only; float32 wav comes back empty
+      - it trusts the header, so a streamed wav with an indeterminate size
+        field transcribes as empty while identical audio with a true header
+        is fine
+    """
+    import socket as _socket
+    s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    s.connect(sock_path)
+    try:
         s.sendall((str(path.resolve()) + "\n").encode())
         buf = b""
         while True:
-            c = s.recv(65536)
-            if not c or b"\n" in buf:
+            chunk = s.recv(65536)
+            if not chunk or b"\n" in buf:
                 break
-            buf += c
+            buf += chunk
+    finally:
         s.close()
-        return buf.decode().strip()
-    except Exception as exc:                       # STT is a nicety, never fatal
-        return f"<stt failed: {exc}>"
+    return buf.decode().strip()
 
 
 def paragraphs(text: str, max_bytes: int, split_lines: bool = True) -> list[str]:
@@ -334,8 +403,50 @@ def _lines(para: str) -> list[str]:
     return out
 
 
+def args_config_path(ap) -> str | None:
+    """--config, read before the full parse so it can set the defaults."""
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None)
+    known, _ = pre.parse_known_args()
+    return known.config
+
+
+def _config_defaults(cfg) -> dict:
+    """config.toml -> argparse dest names.
+
+    Only settings that genuinely exist on both sides. `--stt-every` has no
+    config equivalent on purpose: the server checks every piece, while
+    narrate samples one in N, and collapsing those into one knob would
+    change what the server does.
+    """
+    d = {
+        "ref_seconds": cfg.voice.seconds,
+        "temperature": cfg.sampling.temperature,
+        "top_p": cfg.sampling.top_p,
+        "top_k": cfg.sampling.top_k,
+        "para_max_bytes": cfg.splitting.para_max_bytes,
+        "max_new_tokens": cfg.splitting.max_new_tokens,
+        "max_attempts": cfg.checks.max_attempts,
+        "min_ratio": cfg.checks.duration.min_ratio,
+        "max_ratio": cfg.checks.duration.max_ratio,
+        "max_gap": cfg.post.clamp_internal_silence.max_gap,
+        "long_gap": cfg.post.clamp_internal_silence.long_gap,
+        # Inverted flags: the file says what to DO, the flag says what to skip.
+        "no_snap": not cfg.voice.snap_to_silence,
+        "no_trim": not cfg.post.trim_trailing_silence.enabled,
+    }
+    if cfg.voice.ref:
+        d["ref"] = cfg.voice.ref
+    if cfg.voice.ref_text:
+        d["ref_text"] = cfg.voice.ref_text
+    return d
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default=None,
+                    help="config.toml to read; defaults to the one beside "
+                         "the repo. Flags override it.")
     ap.add_argument("--checkpoint", default=None,
                     help="Drama 3 snapshot dir; found via DRAMA3_CKPT "
                          "or HF_HOME when omitted")
@@ -343,7 +454,14 @@ def main() -> None:
     ap.add_argument("--mode", choices=("paragraph", "auto", "oneshot"),
                     default="paragraph")
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--ref", default="source clips/test audio.mp3")
+    # ⚠️ No default. It used to point at "source clips/test audio.mp3",
+    # a file on the author's machine that is deliberately NOT in this
+    # repo -- it is a real person's voice. A stranger who omitted --ref
+    # got a file-not-found naming a path they had never heard of, rather
+    # than being told a reference clip is required.
+    ap.add_argument("--ref", default=None,
+                    help="30-60 s of one person speaking cleanly. Required; "
+                         "also settable as voice.ref in config.toml")
     # 30 with snapping lands at 28.2 s on this clip, which the user judged
     # clearly better than the old hard 20 s cut. 56 s was marginally better
     # again but costs ~10 % in prefill on every chunk.
@@ -424,7 +542,28 @@ def main() -> None:
     ap.add_argument("--max-ratio", type=float, default=2.2)
     ap.add_argument("--stt-every", type=int, default=0,
                     help="transcribe every Nth chunk as a drift check (0 = off)")
+    # ⚠️ config.toml used to drive the SERVER ONLY. Setting `[voice]
+    # seconds = 56.0` and running narrate silently got you the argparse
+    # default of 30 -- a clean room measured `reference: snapped 30.0s ->
+    # 27.2s` from narrate against `1206 codes (56.0s)` from the server on
+    # the same file. Two configuration systems that disagree is worse than
+    # one, so narrate now reads the same file.
+    #
+    # set_defaults() rather than reading cfg at each use site: it gives
+    # defaults -> config.toml -> flag for free, and an explicit flag still
+    # wins because argparse only applies a default when the flag is absent.
+    cfg = config.load(args_config_path(ap))
+    ap.set_defaults(**_config_defaults(cfg))
+
     args = ap.parse_args()
+    args._cfg = cfg
+    if not args.ref:
+        raise SystemExit(
+            "no reference clip: pass --ref, or set voice.ref in config.toml.\n"
+            "It wants 30-60 s of one person speaking cleanly, any format "
+            "ffmpeg reads.\nThis repo ships none: a voice belongs to "
+            "somebody. LibriSpeech dev-clean or LibriVox work if you have "
+            "no recording of your own.")
     # Falls back to HF_HOME discovery, and raises with an
     # instruction rather than a TypeError deep in from_pretrained.
     args.checkpoint = args.checkpoint or str(paths.checkpoint())

@@ -36,7 +36,7 @@ from the header (`rest.go`). So:
 
     GET  /health -> 200 {"ready": true, ...}
 
-`voice` and `speed` are accepted and ignored: the voice is the reference
+  speed      honoured: ffmpeg atempo, 0.25-4.0, pitch preserved.
 clip this process was started with, and speed is not a knob the model
 exposes. They are accepted rather than rejected so a stock `say` config
 template works unmodified.
@@ -64,6 +64,7 @@ FISH = paths.install()
 import numpy as np
 import torch
 
+import config
 import narrate
 import offload
 import prefix_kv
@@ -76,7 +77,8 @@ from fish_speech.models.text2semantic.inference import (
 
 SR = narrate.SR
 STATE: dict = {"ready": False, "requests": 0, "audio_seconds": 0.0,
-               "generate_seconds": 0.0, "started": time.time()}
+               "generate_seconds": 0.0, "verify_seconds": 0.0, "verify_calls": 0,
+               "retries": 0, "gave_up": 0, "started": time.time()}
 # One GPU, one model, one set of KV caches. Two concurrent generations would
 # interleave writes into the same cache buffers and produce two wrong
 # answers, so requests are serialised. ThreadingHTTPServer is still used so
@@ -117,11 +119,168 @@ def to_wav_bytes(audio: np.ndarray) -> bytes:
     return buf.getvalue()
 
 
+def stt_similarity(audio: np.ndarray, text: str, scratch: Path,
+                   min_words: int = 8, tail_fraction: float = 0.25
+                   ) -> tuple[float | None, str]:
+    """Word-level similarity between what was asked for and what came out.
+
+    Returns the LOWER of the whole-piece score and the tail score -- see the
+    comment at the bottom for why the tail is scored separately.
+
+    ⚠️ This exists because the duration check CANNOT catch the failure it is
+    meant to catch. A bad draw speaks gibberish for about as long as the real
+    words take, so `0.55 <= ratio <= 2.2` passes it on the first attempt and
+    no retry happens. Observed on a book: "der pausbomwerk denisian" in place
+    of "their world", at the right length, scoring a perfectly acceptable
+    duration ratio.
+
+    STT is not a transcript oracle -- it normalises numbers, drops
+    punctuation and mangles proper nouns, so good audio lands around 0.95
+    rather than 1.00. The threshold only has to separate that from a draw
+    that has stopped speaking English at all, which scores ~0.6 or below.
+
+    Returns None when no STT socket is configured, in which case the caller
+    keeps the old duration-only behaviour.
+    """
+    if paths.stt_socket() is None:
+        return None, ""
+    # ⚠️ NOT /tmp. The STT daemon runs PrivateTmp=true, so a wav under /tmp
+    # is invisible to it and comes back empty -- which would look exactly
+    # like the gibberish this is trying to detect.
+    wav = scratch / "_verify.wav"
+    wav.write_bytes(to_wav_bytes(audio))
+    out = scratch / "_verify16.wav"
+    try:
+        import subprocess
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(wav),
+                        "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+                        str(out)], check=True)
+        heard = narrate.transcribe(out)
+    except Exception:
+        return None, ""
+    finally:
+        wav.unlink(missing_ok=True)
+        out.unlink(missing_ok=True)
+    if not heard or heard.startswith("<stt"):
+        return None, ""
+    import re
+    from difflib import SequenceMatcher
+    w = re.findall(r"[a-z0-9]+", text.lower())
+    g = re.findall(r"[a-z0-9]+", heard.lower())
+    # ⚠️ Too short to judge. STT similarity on a couple of words is noise:
+    # the 8-byte warm-up text "Warm up." scored 0.44 and triggered a
+    # spurious regeneration. The duration check has the same bypass
+    # (expected < 1.5 s) for the same reason -- a short utterance cannot
+    # carry enough signal to separate a bad draw from ASR variance.
+    if len(w) < min_words:
+        return None, heard
+    overall = SequenceMatcher(None, w, g).ratio()
+
+    # ⚠️ Also score the TAIL on its own. Similarity over a whole piece is
+    # diluted by length: a 196-word chunk from the book containing clear
+    # gibberish ("a gotiwerkte lartes setting passanting", "tecutu") still
+    # scored 0.87, because only ~25 words were wrong. And the tail is
+    # exactly where this fails -- the report that started this was
+    # "gibberish at the end of longer paragraphs".
+    #
+    # The last quarter, minimum 8 words, so a short piece is judged whole.
+    tail_n = max(min_words, int(len(w) * tail_fraction))
+    if len(w) > tail_n:
+        tail = SequenceMatcher(None, w[-tail_n:], g[-tail_n:]).ratio()
+        return min(overall, tail), heard
+    return overall, heard
+
+
+# What a client may ask for, and what ffmpeg needs to produce it. wav is
+# native; everything else is a transcode of it.
+FORMATS = {
+    "wav": ("audio/wav", None),
+    "pcm": ("audio/L16", None),           # headerless 16-bit LE, 44.1 kHz
+    "mp3": ("audio/mpeg", ["-f", "mp3", "-b:a", "128k"]),
+    "flac": ("audio/flac", ["-f", "flac"]),
+    "opus": ("audio/opus", ["-f", "opus", "-b:a", "96k"]),
+    "aac": ("audio/aac", ["-f", "adts", "-b:a", "128k"]),
+}
+
+
+def atempo_factors(speed: float) -> list[float]:
+    """atempo accepts 0.5-2.0 per instance; OpenAI allows 0.25-4.0, so
+    anything outside that range becomes a chain whose product is `speed`."""
+    factors, remaining = [], speed
+    while remaining > 2.0:
+        factors.append(2.0); remaining /= 2.0
+    while remaining < 0.5:
+        factors.append(0.5); remaining /= 0.5
+    factors.append(remaining)
+    return factors
+
+
+def apply_speed(audio: np.ndarray, speed: float) -> np.ndarray:
+    """Change playback rate, preserve pitch. Returns samples, not a file.
+
+    ⚠️ Deliberately PCM in and PCM out. The obvious implementation -- ask
+    ffmpeg for wav on stdout -- produces a wav whose size field is
+    0xFFFFFFFF, because ffmpeg cannot seek back on a pipe to patch the
+    header. Readers then report absurd durations (measured: 48695 s for a
+    6.6 s clip) or treat it as empty. That failure is already written up in
+    to_wav_bytes() and it was reintroduced here anyway.
+
+    Staying in samples also means the format encoder below is unchanged
+    whether or not speed was applied.
+    """
+    if abs(speed - 1.0) < 1e-3:
+        return audio
+    import subprocess
+    pcm_in = (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+    done = subprocess.run(
+        ["ffmpeg", "-v", "error",
+         "-f", "s16le", "-ar", str(SR), "-ac", "1", "-i", "pipe:0",
+         "-filter:a", ",".join(f"atempo={f:.6f}" for f in atempo_factors(speed)),
+         "-f", "s16le", "-ar", str(SR), "-ac", "1", "pipe:1"],
+        input=pcm_in, capture_output=True)
+    if done.returncode != 0:
+        raise RuntimeError(f"ffmpeg speed={speed}: {done.stderr.decode()[:200]}")
+    return np.frombuffer(done.stdout, dtype="<i2").astype(np.float32) / 32768.0
+
+
+def encode(audio: np.ndarray, fmt: str, speed: float = 1.0) -> tuple[bytes, str]:
+    """Return (bytes, content-type) in the requested format and speed.
+
+    ⚠️ `speed` is APPLIED, not ignored. It used to be accepted and
+    discarded, which is the worse half of the silent-failure category: a
+    server that rejects an unimplemented parameter tells the client, one
+    that accepts it does not. Measured by say's author against this
+    server, the same text at 1.0 and 1.5 differed by 5 % -- run-to-run
+    variance, not speed.
+
+    The damage was not the missing feature. `speed` is part of a reading
+    client's CACHE KEY, so changing it invalidated a whole document,
+    regenerated every paragraph, and returned byte-identical audio.
+
+    The model has no speed control, so this is a post-process. That is
+    enough to make the parameter true, which is what a cache key needs.
+    """
+    audio = apply_speed(audio, speed)
+    ctype, args = FORMATS[fmt]
+    body = to_wav_bytes(audio)           # always a real header
+    if fmt == "pcm":
+        return body[44:], ctype          # strip the header we just wrote
+    if args is None:
+        return body, ctype
+    import subprocess
+    done = subprocess.run(["ffmpeg", "-v", "error", "-i", "pipe:0", *args, "pipe:1"],
+                          input=body, capture_output=True)
+    if done.returncode != 0:
+        raise RuntimeError(f"ffmpeg {fmt}: {done.stderr.decode()[:200]}")
+    return done.stdout, ctype
+
+
 class Engine:
     """The model, loaded once."""
 
-    def __init__(self, args) -> None:
+    def __init__(self, args, cfg) -> None:
         self.args = args
+        self.cfg = cfg
         device = torch.device(args.device)
         self.device = device
         os.environ["FISH_DRAMA3_CUDA_GRAPH"] = args.cuda_graph
@@ -165,16 +324,18 @@ class Engine:
         # The reference, encoded once.
         wav = Path(args.state_dir) / "reference.wav"
         wav.parent.mkdir(parents=True, exist_ok=True)
-        seconds = args.ref_seconds
-        if seconds and not args.no_snap:
+        seconds = cfg.voice.seconds
+        if seconds and cfg.voice.snap_to_silence:
             seconds = narrate.snap_to_silence(Path(args.ref), seconds)
         narrate.to_pcm16(Path(args.ref), wav, seconds)
-        ref_text = args.ref_text or narrate.transcribe(wav)
+        ref_text = args.ref_text or cfg.voice.ref_text or narrate.transcribe(wav)
         if not ref_text or ref_text.startswith("<stt"):
             raise SystemExit(
-                f"no reference transcript ({ref_text!r}); pass --ref-text. "
-                "It is worth writing by hand: ASR errors in the reference are "
-                "inherited by every paragraph this server ever speaks.")
+                f"no reference transcript ({ref_text!r}); pass --ref-text, "
+                "or set DRAMA3_STT and it will be transcribed for you. "
+                "An approximate transcript is far better than none: a wrong "
+                "one measured no worse on timbre or content (notes/17), but "
+                "the model still needs some text to align the clip against.")
         self.prompt_texts = (ref_text,)
         self.prompt_tokens = (encode_audio(wav, self.codec, device),)
         log(f"reference: {self.prompt_tokens[0].shape[1]} codes "
@@ -210,48 +371,99 @@ class Engine:
 
     def speak(self, text: str) -> np.ndarray:
         """One paragraph in, one waveform out. Caller holds GPU."""
-        args = self.args
-        pieces = internal_pieces(text, args.para_max_bytes)
+        args, cfg = self.args, self.cfg
+        dur, con = cfg.checks.duration, cfg.checks.content
+        pieces = internal_pieces(text, cfg.splitting.para_max_bytes)
         out = []
         for piece in pieces:
             prompt = build_drama3_prompt(piece, self.model.tokenizer,
                                          self.model.config,
                                          self.prompt_texts, self.prompt_tokens)
-            budget = narrate.frame_budget(piece, args.max_new_tokens)
+            budget = narrate.frame_budget(piece, cfg.splitting.max_new_tokens)
             expected = len(piece.encode()) / narrate.BYTES_PER_SECOND
             best = None
-            for attempt in range(args.max_attempts):
+            for attempt in range(cfg.checks.max_attempts):
                 if attempt:
-                    budget = args.max_new_tokens
+                    budget = cfg.splitting.max_new_tokens
                 if self.prefix is not None:
                     frames, _ = prefix_kv.generate_drama3_prefix(
                         self.model, prompt, self.prefix, max_new_tokens=budget,
-                        temperature=args.temperature, top_p=args.top_p,
-                        top_k=args.top_k, prefill_chunk_size=args.prefill_chunk)
+                        temperature=cfg.sampling.temperature, top_p=cfg.sampling.top_p,
+                        top_k=cfg.sampling.top_k,
+                        prefill_chunk_size=args.prefill_chunk)
                 else:
                     from fish_speech.models.text2semantic.fish_omni.generate import generate_drama3
                     frames, _ = generate_drama3(
                         self.model, prompt, max_new_tokens=budget,
-                        temperature=args.temperature, top_p=args.top_p,
-                        top_k=args.top_k, prefill_chunk_size=args.prefill_chunk)
+                        temperature=cfg.sampling.temperature, top_p=cfg.sampling.top_p,
+                        top_k=cfg.sampling.top_k,
+                        prefill_chunk_size=args.prefill_chunk)
                 if not len(frames):
                     continue
                 audio = decode_to_audio(frames[:, 1:].T.to(self.device),
                                         self.codec).float().cpu().numpy()
                 end = narrate.speech_end(audio, SR)
                 ratio = end / expected if expected else 1.0
+                # Provisional score on duration alone; refined below if the
+                # content check runs. LOWER IS BETTER.
                 score = abs(1.0 - ratio)
+                duration_ok = (not dur.enabled or expected < dur.min_seconds
+                               or dur.min_ratio <= ratio <= dur.max_ratio)
+                similarity = None
+                if duration_ok and con.enabled:
+                    t_v = time.perf_counter()
+                    similarity, heard = stt_similarity(
+                        audio, piece, Path(args.state_dir),
+                        con.min_words, con.tail_fraction)
+                    STATE["verify_seconds"] = round(
+                        STATE["verify_seconds"] + time.perf_counter() - t_v, 2)
+                    STATE["verify_calls"] += 1
+                if similarity is not None:
+                    # Content dominates duration: a draw that says the right
+                    # words slightly too fast beats one that says the wrong
+                    # words at the right pace.
+                    score = 2.0 * (1.0 - similarity) + abs(1.0 - ratio)
+                # ⚠️ COMPARE, do not overwrite. This assignment used to be
+                # unconditional, so when every attempt failed verification the
+                # LAST one was delivered rather than the best -- which is the
+                # opposite of what you want from a give-up path.
                 if best is None or score < best[0]:
-                    best = (score, audio, end)
-                if expected < 1.5 or args.min_ratio <= ratio <= args.max_ratio:
+                    best = (score, audio, end, similarity)
+                if similarity is not None and similarity < con.min_similarity:
+                    STATE["retries"] += 1
+                    # ⚠️ Log BOTH tails. The score alone cannot tell a real
+                    # failure from ASR mangling a technical term at the end of
+                    # a piece -- "BACPAC" heard as "backpack" scores the same
+                    # as genuine nonsense, and the only way to tell is to read
+                    # them side by side.
+                    log(f"  retry {attempt+1}: sim {similarity:.2f} "
+                        f"({len(piece.encode())}B)")
+                    log(f"     want ...{piece[-70:]!r}")
+                    log(f"     got  ...{heard[-70:]!r}")
+                    continue
+                if duration_ok:
                     break
             if best is None:
                 raise RuntimeError("no frames generated")
-            _, audio, end = best
-            if end > 0:
-                audio = audio[: min(len(audio), int((end + 0.15) * SR))]
-            audio = narrate.clamp_internal_silence(
-                audio, SR, args.max_gap, args.long_gap, narrate.pause_budget(piece))
+            _, audio, end, best_sim = best
+            # Attempts are bounded (--max-attempts, default 3). When they are
+            # all used up this DELIVERS the best draw rather than failing or
+            # looping: an imperfect paragraph beats a hole in the audiobook.
+            # It says so in the log, so a document full of these is visible
+            # rather than silent.
+            if (con.enabled and best_sim is not None
+                    and best_sim < con.min_similarity):
+                STATE["gave_up"] += 1
+                log(f"  GAVE UP after {cfg.checks.max_attempts} attempts, best was "
+                    f"{best_sim:.2f} -- delivering it anyway")
+            trim = cfg.post.trim_trailing_silence
+            if trim.enabled and end > 0:
+                audio = audio[: min(len(audio), int((end + trim.pad_seconds) * SR))]
+            clamp = cfg.post.clamp_internal_silence
+            if clamp.enabled:
+                audio = narrate.clamp_internal_silence(
+                    audio, SR, clamp.max_gap, clamp.long_gap,
+                    narrate.pause_budget(piece))
             out.append(audio)
         return np.concatenate(out) if len(out) > 1 else out[0]
 
@@ -262,6 +474,11 @@ def log(message: str) -> None:
 
 class Handler(BaseHTTPRequestHandler):
     engine: Engine = None  # set in main
+    # BaseHTTPRequestHandler defaults to HTTP/1.0, which means a new TCP
+    # connection per request and no keep-alive. Every response here sends an
+    # accurate Content-Length, which is the only requirement for 1.1, and
+    # some clients and proxies are unhappy with 1.0.
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *a):      # quieter than the default
         pass
@@ -277,6 +494,11 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(obj).encode(), "application/json")
 
     def do_GET(self):
+        if self.path.rstrip("/") == "/v1/models":
+            # Some OpenAI clients list models before their first call.
+            self._json(200, {"object": "list", "data": [
+                {"id": "drama-3", "object": "model", "owned_by": "fishaudio"}]})
+            return
         if self.path.rstrip("/") in ("/health", "/healthz", ""):
             uptime = time.time() - STATE["started"]
             rtf = (STATE["generate_seconds"] / STATE["audio_seconds"]
@@ -284,21 +506,44 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {**STATE, "uptime_seconds": round(uptime, 1),
                              "rtf": round(rtf, 3) if rtf else None})
         else:
-            self._json(404, {"error": "GET /health, POST /tts"})
+            self._json(404, {"error": "GET /health or /v1/models; "
+                                      "POST /v1/audio/speech or /tts"})
 
     def do_POST(self):
-        if self.path.rstrip("/") not in ("/tts", "/tts_to_audio"):
-            self._json(404, {"error": "POST /tts"})
+        # Three routes, same engine. Nothing here is specific to any one
+        # client -- the point is that a tool which already speaks to some
+        # other TTS server can be pointed at this one unchanged.
+        #
+        #   /v1/audio/speech   OpenAI. Field "input", default format mp3.
+        #   /tts_to_audio      XTTS-api-server. Field "text", wav.
+        #   /tts               this project's own. Field "text", wav.
+        route = self.path.rstrip("/") or "/"
+        if route not in ("/tts", "/tts_to_audio", "/v1/audio/speech"):
+            self._json(404, {"error": "POST /v1/audio/speech, /tts or /tts_to_audio"})
             return
+        openai = route == "/v1/audio/speech"
         try:
             length = int(self.headers.get("content-length", 0))
             payload = json.loads(self.rfile.read(length) or b"{}")
-            text = (payload.get("text") or "").strip()
+            # OpenAI calls it "input"; everyone else calls it "text". Accept
+            # either on any route rather than being pedantic about it.
+            text = (payload.get("input") or payload.get("text") or "").strip()
+            fmt = (payload.get("response_format")
+                   or payload.get("format")
+                   or ("mp3" if openai else "wav")).lower()
+            speed = float(payload.get("speed") or 1.0)
         except Exception as exc:
             self._json(400, {"error": f"bad request: {exc}"})
             return
         if not text:
-            self._json(400, {"error": "no text"})
+            self._json(400, {"error": "no text: send 'input' or 'text'"})
+            return
+        if fmt not in FORMATS:
+            self._json(400, {"error": f"unsupported response_format {fmt!r}; "
+                                      f"have {', '.join(sorted(FORMATS))}"})
+            return
+        if not 0.25 <= speed <= 4.0:
+            self._json(400, {"error": f"speed {speed} outside 0.25-4.0"})
             return
         started = time.perf_counter()
         try:
@@ -316,23 +561,29 @@ class Handler(BaseHTTPRequestHandler):
         STATE["audio_seconds"] = round(STATE["audio_seconds"] + seconds, 2)
         STATE["generate_seconds"] = round(STATE["generate_seconds"] + elapsed, 2)
         log(f"{len(text.encode()):5d}B -> {seconds:6.2f}s audio in "
-            f"{elapsed:6.2f}s  rtf {elapsed/max(seconds,1e-9):.2f}")
-        self._send(200, to_wav_bytes(audio), "audio/wav")
+            f"{elapsed:6.2f}s  rtf {elapsed/max(seconds,1e-9):.2f}  "
+            f"[{fmt}{'' if abs(speed-1)<1e-3 else f' x{speed:g}'}]")
+        try:
+            body, ctype = encode(audio, fmt, speed)
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+            return
+        self._send(200, body, ctype)
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Resident Drama 3 TTS server. Settings come from "
+                    "config.toml; any flag here overrides the file.")
+    ap.add_argument("--config", default=None,
+                    help="TOML settings file (default: ./config.toml if present)")
     ap.add_argument("--checkpoint", default=None)
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8123)
-    ap.add_argument("--ref", required=True)
+    ap.add_argument("--host", default=None)
+    ap.add_argument("--port", type=int, default=None)
+    ap.add_argument("--ref", default=None)
     ap.add_argument("--ref-text", default=None)
-    ap.add_argument("--ref-seconds", type=float, default=56.0)
-    ap.add_argument("--no-snap", action="store_true")
     ap.add_argument("--state-dir", default=None)
     ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--para-max-bytes", type=int, default=400)
-    ap.add_argument("--max-new-tokens", type=int, default=600)
     ap.add_argument("--prefill-chunk", type=int, default=1024)
     ap.add_argument("--vram-reserve", type=float, default=2.0)
     ap.add_argument("--fetch-backend", choices=("triton", "cpp"), default="cpp")
@@ -342,25 +593,71 @@ def main() -> None:
     ap.add_argument("--slice-lm-head", action="store_true", default=True)
     ap.add_argument("--offload-embed", action="store_true", default=True)
     ap.add_argument("--prefix-kv", action="store_true", default=True)
-    ap.add_argument("--temperature", type=float, default=1.0)
-    ap.add_argument("--top-p", type=float, default=0.9)
-    ap.add_argument("--top-k", type=int, default=4097)
-    ap.add_argument("--max-attempts", type=int, default=3)
-    ap.add_argument("--min-ratio", type=float, default=0.55)
-    ap.add_argument("--max-ratio", type=float, default=2.2)
-    ap.add_argument("--max-gap", type=float, default=0.5)
-    ap.add_argument("--long-gap", type=float, default=1.2)
+    # Switches that override a config section wholesale, for a one-off run
+    # without editing the file.
+    ap.add_argument("--no-verify-stt", action="store_true",
+                    help="disable the content check for this run")
+    ap.add_argument("--no-checks", action="store_true",
+                    help="disable every quality check; fastest, least safe")
     args = ap.parse_args()
+
+    cfg = config.load(args.config)
+    if args.no_verify_stt or args.no_checks:
+        cfg.checks.content.enabled = False
+    if args.no_checks:
+        cfg.checks.duration.enabled = False
     args.checkpoint = args.checkpoint or str(paths.checkpoint())
     args.state_dir = args.state_dir or str(paths.HOME / "run")
+    args.ref = args.ref or cfg.voice.ref
+    args.host = args.host or cfg.server.host
+    args.port = args.port or cfg.server.port
+    if not args.ref:
+        raise SystemExit("no reference clip: set --ref or voice.ref in config.toml")
 
-    Handler.engine = Engine(args)
+    log(f"config: {cfg._path}")
+    log(config.describe(cfg))
+
+    Handler.engine = Engine(args, cfg)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    log(f"listening on http://{args.host}:{args.port}  (POST /tts, GET /health)")
+
+    # ⚠️ Publish the address we ACTUALLY bound, for anything that needs to
+    # reach us. drama3ctl used to assume 127.0.0.1:8123 and pass it as a
+    # flag, which silently beat `[server] port` in config.toml: the server
+    # obeyed the config, the launcher health-checked its own guess, and
+    # `drama3ctl config` handed clients a URL nothing was listening on.
+    # A reader is never wrong in the way a guesser is.
+    #
+    # getsockname(), not args.port, so `port = 0` (ask the OS) reports the
+    # real number rather than a zero.
+    bound_host, bound_port = server.socket.getsockname()[:2]
+    url = f"http://{args.host or bound_host}:{bound_port}"
+    url_file = Path(args.state_dir) / "server.url"
+    url_file.parent.mkdir(parents=True, exist_ok=True)
+    url_file.write_text(url + "\n")
+
+    log(f"listening on {url}  (POST /v1/audio/speech, GET /health)")
+
+    # ⚠️ SIGTERM, not just Ctrl-C. `drama3ctl stop` signals the process
+    # group, and without this the finally: below never ran -- server.url
+    # outlived the server, so `drama3ctl config` handed clients a URL
+    # with nothing listening on it. The cleanup existed and was simply
+    # unreachable by the only shutdown path anyone actually uses.
+    import signal
+
+    def _terminate(signum, _frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(signal.SIGINT, _terminate)
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         log("stopping")
+    finally:
+        # Stale file here means a client connects to a dead port and waits,
+        # which reads as a hang rather than as "not running".
+        url_file.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
