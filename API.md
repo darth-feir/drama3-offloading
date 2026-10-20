@@ -40,7 +40,14 @@ Errors return JSON: `{"error": "..."}` with 400 or 500.
 | `input` | yes | the text. `text` is accepted as a synonym |
 | `response_format` | no | `wav` `mp3` `flac` `opus` `aac` `pcm`. **Defaults to `mp3`**, per the OpenAI spec |
 | `model` | no | accepted and ignored; one model per process |
-| `voice` | no | accepted and ignored; see *One voice per process* below |
+| `voice` | no | **a registered voice name.** Omit for the default. An unknown name is a `400` naming what exists |
+
+`GET /v1/voices` lists them — the shape openedai-speech and Kokoro-FastAPI
+use, so a client that already discovers voices needs no new code:
+
+```json
+{"voices": [{"id": "narrator", "default": true}]}
+```
 | `speed` | no | **honoured.** `0.25`–`4.0`, default `1.0`. Outside that range is a `400`, not a clamp |
 
 **`speed` is a real post-process**, not a hint: ffmpeg `atempo` with pitch

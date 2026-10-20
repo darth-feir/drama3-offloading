@@ -12,6 +12,13 @@
 #                     worse on timbre or content, only ~8 % slower. See
 #                     notes/17.
 #   DRAMA3_PORT       default 8123
+#   DRAMA3_STT        OpenAI-compatible transcription endpoint
+#   DRAMA3_STT_START  OPTIONAL command that starts a local STT server if
+#                     DRAMA3_STT is not answering. The server transcribes
+#                     the reference clip at startup when DRAMA3_REF_TEXT
+#                     is unset, so a dead STT is a failed boot, not a
+#                     degraded one -- that happened, 20 s before the STT
+#                     came up. Only ever stopped again if WE started it.
 #
 # ⚠️ Liveness is tracked with a PID FILE, never by matching command-line
 # text. `pgrep -f "[p]ip install"` hung a wait loop indefinitely during this
@@ -24,6 +31,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 RUN="${DRAMA3_RUN:-$REPO/run}"
 PIDFILE="$RUN/server.pid"
+STT_PIDFILE="$RUN/stt.pid"
 LOGFILE="$RUN/server.log"
 # ⚠️ Deliberately EMPTY when unset, not defaulted to 8123/127.0.0.1.
 # These are only passed to the server if the user actually set them; the
@@ -61,6 +69,42 @@ health() {
     curl -fsS --max-time 3 "$(base_url)/health" 2>/dev/null
 }
 
+stt_ok() {
+    # No endpoint configured is "fine" here: the content check is optional
+    # and the server says so itself.
+    [ -n "${DRAMA3_STT:-}" ] || return 0
+    case "$DRAMA3_STT" in
+        http*) curl -fsS --max-time 3 "${DRAMA3_STT%/}/health" >/dev/null 2>&1 ;;
+        *)     [ -S "$DRAMA3_STT" ] || [ -e "$DRAMA3_STT" ] ;;
+    esac
+}
+
+start_stt_if_needed() {
+    stt_ok && return 0
+    if [ -z "${DRAMA3_STT_START:-}" ]; then
+        echo "note: DRAMA3_STT=$DRAMA3_STT is not answering and" >&2
+        echo "      DRAMA3_STT_START is unset, so it will not be started." >&2
+        echo "      Without STT the content check is off, and startup FAILS" >&2
+        echo "      outright unless DRAMA3_REF_TEXT is set." >&2
+        return 0
+    fi
+    echo "starting STT: $DRAMA3_STT_START"
+    setsid bash -c "$DRAMA3_STT_START" >> "$RUN/stt.log" 2>&1 &
+    echo $! > "$STT_PIDFILE"
+    local waited=0
+    while [ "$waited" -lt 90 ]; do
+        stt_ok && { echo "STT ready after ${waited}s"; return 0; }
+        alive "$(cat "$STT_PIDFILE" 2>/dev/null)" || {
+            echo "STT died on startup. Last lines:" >&2
+            tail -10 "$RUN/stt.log" >&2
+            rm -f "$STT_PIDFILE"
+            return 1
+        }
+        sleep 2; waited=$((waited + 2))
+    done
+    echo "STT still not answering after ${waited}s; continuing anyway" >&2
+}
+
 cmd_start() {
     local pid
     if pid="$(current_pid)"; then
@@ -87,6 +131,8 @@ cmd_start() {
     # ⚠️ Rotate, do not truncate. Truncating on start destroyed the evidence
     # from an A/B run the moment the second arm started -- the retry detail
     # that the whole experiment existed to collect.
+    start_stt_if_needed || return 1
+
     # A crash leaves server.url behind; clear it so base_url() cannot
     # report a port that died with the last process.
     rm -f "$URLFILE"
@@ -121,12 +167,26 @@ cmd_start() {
     return 1
 }
 
+stop_stt_if_ours() {
+    # ⚠️ ONLY stop an STT we started. The pidfile is the entire proof of
+    # ownership: this box runs a long-lived Parakeet server of its own,
+    # and a launcher that killed "the STT on that port" would take down
+    # something it never started and cannot bring back.
+    [ -f "$STT_PIDFILE" ] || return 0
+    local spid; spid="$(cat "$STT_PIDFILE" 2>/dev/null)"
+    rm -f "$STT_PIDFILE"
+    alive "$spid" || return 0
+    echo "stopping STT (pid $spid, started by us)"
+    kill -TERM -"$spid" 2>/dev/null || kill -TERM "$spid" 2>/dev/null
+}
+
 cmd_stop() {
     local pid
     # ⚠️ Clear the URL on EVERY stop path, including "was not running".
     # The server removes it on clean shutdown, but a SIGKILL or a crash
     # leaves it behind, and a stale URL reads as a live server.
     rm -f "$URLFILE"
+    stop_stt_if_ours
     pid="$(current_pid)" || { echo "not running"; rm -f "$PIDFILE"; return 0; }
     # setsid made it a process group leader, so signal the group: bin/run.sh
     # execs through nix-shell, and killing only the pid can orphan python
@@ -202,7 +262,140 @@ EOF
 EOF
 }
 
+cmd_voices() {
+    "$REPO/bin/run.sh" - <<'PY'
+import sys; sys.path.insert(0, "bin")
+import voices
+names = voices.names()
+if not names:
+    print("no voices yet.  add one:")
+    print("  bin/drama3ctl --addvoice NAME /path/to/clip.mp3")
+else:
+    default = voices.get_default()
+    for n in names:
+        m = voices.meta(n)
+        mark = "*" if n == default else " "
+        print(f" {mark} {n:<16} {m['seconds']:>5.1f}s  "
+              f"{m['bytes']/2**20:>4.0f} MiB  {m['source']}")
+    print()
+    print("* = default")
+PY
+}
+
+cmd_addvoice() {
+    local name="${1:-}" clip="${2:-}"; shift 2 2>/dev/null || true
+    [ -n "$name" ] && [ -n "$clip" ] || {
+        echo "usage: $(basename "$0") --addvoice NAME /path/to/clip.mp3" >&2
+        return 2
+    }
+    # ⚠️ If the server is up, ask IT to build the voice. It already holds
+    # the model; the work is ~3 s of prefill queued behind whatever it is
+    # doing. This used to stop and restart the server (~70 s) purely
+    # because the builder loaded a second copy of the model and two will
+    # not fit on a 24 GiB card -- which was an artifact of how the builder
+    # was written, not a real constraint.
+    if current_pid >/dev/null; then
+        local url; url="$(base_url)"
+        local reftext=""
+        # --ref-text "..." may appear among the passthrough args
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --ref-text) reftext="${2:-}"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        echo "server is up; building '$name' in place (no restart)..."
+        "$REPO/bin/run.sh" - "$url" "$name" "$clip" "$reftext" <<'PY'
+import json, sys, urllib.request
+url, name, clip, reftext = sys.argv[1:5]
+body = {"name": name, "clip": clip}
+if reftext:
+    body["ref_text"] = reftext
+req = urllib.request.Request(url.rstrip("/") + "/admin/voices",
+                             data=json.dumps(body).encode(),
+                             headers={"Content-Type": "application/json"})
+try:
+    # No timeout: it queues behind any in-flight generation, which can
+    # legitimately take tens of seconds on a long paragraph.
+    with urllib.request.urlopen(req) as r:
+        info = json.load(r)
+    print(f"voice {info['name']!r}: {info['bytes']/2**20:.0f} MiB, "
+          f"{info['rows']} rows, built in {info['elapsed']}s -- ready now")
+except urllib.error.HTTPError as exc:
+    print(exc.read().decode()[:400], file=sys.stderr)
+    sys.exit(1)
+PY
+        return $?
+    fi
+
+    # Nothing running: load a model of our own and build offline.
+    "$REPO/bin/run.sh" bin/addvoice.py "$name" "$clip" \
+        --dev-cache --pin-experts --vram-reserve 2 "$@"
+}
+
+cmd_delvoice() {
+    local name="${1:-}"
+    [ -n "$name" ] || { echo "usage: $(basename "$0") --delvoice NAME" >&2; return 2; }
+    # If the server is up, tell IT -- otherwise the files go but the
+    # running process keeps serving a voice the user thinks is deleted.
+    if current_pid >/dev/null; then
+        "$REPO/bin/run.sh" - "$(base_url)" "$name" <<'PY'
+import json, sys, urllib.request
+url, name = sys.argv[1:3]
+req = urllib.request.Request(url.rstrip("/") + "/admin/voices/remove",
+                             data=json.dumps({"name": name}).encode(),
+                             headers={"Content-Type": "application/json"})
+try:
+    with urllib.request.urlopen(req, timeout=30) as r:
+        info = json.load(r)
+    left = ", ".join(info["voices"]) or "(none)"
+    print(f"removed {info['removed']!r}; remaining: {left}")
+    if info.get("default"):
+        print(f"default is now {info['default']!r}")
+except urllib.error.HTTPError as exc:
+    print(exc.read().decode()[:300], file=sys.stderr); sys.exit(1)
+PY
+        return $?
+    fi
+    "$REPO/bin/run.sh" - "$name" <<'PY'
+import sys; sys.path.insert(0, "bin")
+import voices
+name = sys.argv[1]
+if name not in voices.names():
+    print(f"no voice named {name!r}; have: "
+          f"{', '.join(voices.names()) or '(none)'}", file=sys.stderr)
+    sys.exit(1)
+voices.remove(name)
+print(f"removed {name!r}; remaining: {', '.join(voices.names()) or '(none)'}")
+PY
+}
+
+cmd_defaultvoice() {
+    local name="${1:-}"
+    [ -n "$name" ] || { echo "usage: $(basename "$0") --defaultvoice NAME" >&2; return 2; }
+    "$REPO/bin/run.sh" - "$name" <<'PY'
+import sys; sys.path.insert(0, "bin")
+import voices
+voices.set_default(sys.argv[1])
+print(f"default voice is now {sys.argv[1]!r}")
+PY
+    current_pid >/dev/null && echo "restart to apply:  $(basename "$0") --restart"
+}
+
 case "${1:-}" in
+    # Flag forms, because "--start" reads like a program and "start" reads
+    # like a subcommand, and people reach for the first.
+    --start)        shift; cmd_start "$@"; rc=$?
+                    [ $rc -eq 0 ] && { echo; echo "following the log; Ctrl-C detaches, the server keeps running"; tail -f "$LOGFILE"; }
+                    exit $rc ;;
+    --stop)         cmd_stop ;;
+    --restart)      cmd_stop; shift; cmd_start "$@" ;;
+    --status)       cmd_status ;;
+    --config)       cmd_hint ;;
+    --voices)       cmd_voices ;;
+    --addvoice)     shift; cmd_addvoice "$@" ;;
+    --delvoice)     shift; cmd_delvoice "$@" ;;
+    --defaultvoice) shift; cmd_defaultvoice "$@" ;;
     start)   shift; [ "${1:-}" = "--" ] && shift; cmd_start "$@" ;;
     stop)    cmd_stop ;;
     restart) cmd_stop; shift; [ "${1:-}" = "--" ] && shift; cmd_start "$@" ;;
@@ -214,8 +407,17 @@ case "${1:-}" in
              if [ "${1:-}" = "-f" ]; then tail -f "$LOGFILE"
              else tail -n "${1:-200}" "$LOGFILE"; fi ;;
     config)  cmd_hint ;;
-    *)       { echo "usage: $(basename "$0") start|stop|restart|status|config"
-               echo "       $(basename "$0") log [N|-f]   last N lines (200), -f to follow"
-               echo "status exits 3 when not running."; } >&2
+    voices)    cmd_voices ;;
+    delvoice)  shift; cmd_delvoice "$@" ;;
+    *)       { echo "usage: $(basename "$0") --start | --stop | --restart | --status"
+               echo "       $(basename "$0") --voices"
+               echo "       $(basename "$0") --addvoice NAME /path/to/clip.mp3"
+               echo "       $(basename "$0") --delvoice NAME"
+               echo "       $(basename "$0") --defaultvoice NAME"
+               echo "       $(basename "$0") --config        backend JSON for a client"
+               echo "       $(basename "$0") log [N|-f]      last N lines (200), -f follows"
+               echo
+               echo "Bare subcommands (start, stop, ...) work too; --start also"
+               echo "follows the log. status exits 3 when not running."; } >&2
              exit 2 ;;
 esac

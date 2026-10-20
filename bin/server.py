@@ -347,6 +347,36 @@ class Engine:
                 self.model, self.prompt_texts, self.prompt_tokens, args.prefill_chunk)
             log(f"prefix KV: {self.prefix.P} rows reused, "
                 f"{self.prefix.bytes/2**20:.0f} MiB")
+            # The clip this process was started with is itself a voice, so
+            # one code path serves both; --ref is just the unnamed one.
+            self.prefix.prompt_texts = self.prompt_texts
+            self.prefix.prompt_tokens = self.prompt_tokens
+
+        # Named voices from voices/. Each is ~118 MiB of host RAM against
+        # 30 GiB of pinned experts, so holding several costs nothing.
+        #
+        # ⚠️ A voice that fails its fingerprint is SKIPPED WITH A REASON,
+        # never silently restored. Restoring state built against different
+        # weights or a different cache layout produces plausible audio in
+        # the wrong voice, which no downstream check would catch.
+        self.voices: dict = {}
+        if args.prefix_kv and args.voices:
+            import voices as voicelib
+            for name in voicelib.names():
+                loaded, why = voicelib.load_into(
+                    name, self.model, prefix_kv.PrefixKV,
+                    args.checkpoint, args.prefill_chunk)
+                if loaded is None:
+                    log(f"voice {name!r} SKIPPED -- {why}")
+                    continue
+                self.voices[name] = loaded
+                log(f"voice {name!r}: {loaded.P} rows, "
+                    f"{loaded.bytes/2**20:.0f} MiB")
+            self.default_voice = voicelib.get_default()
+            if self.voices:
+                log(f"voices: {', '.join(sorted(self.voices))}"
+                    f"  default={self.default_voice or '--ref'}")
+        self.default_voice = getattr(self, "default_voice", None)
 
         # ⚠️ Warm up HERE, on the main thread, before the server starts.
         #
@@ -369,25 +399,90 @@ class Engine:
         STATE["ready"] = True
         log(f"ready in {STATE['load_seconds']:.0f}s")
 
-    def speak(self, text: str) -> np.ndarray:
+    def add_voice(self, name: str, clip: str, ref_text: str | None,
+                  ref_seconds: float | None) -> dict:
+        """Build and register a voice using the model already loaded here.
+
+        ⚠️ The caller must hold the GPU lock. Prefilling writes into the
+        same KV caches a generation uses, so this is not something to run
+        beside one -- but it IS something to queue behind one, which is
+        why it no longer needs a restart. Measured: ~3 s, against ~70 s to
+        stop and start the server.
+        """
+        import voices as voicelib
+        prefix, info = voicelib.build(
+            self.model, self.codec, self.device, name, clip,
+            ref_text=ref_text,
+            ref_seconds=ref_seconds or self.cfg.voice.seconds,
+            prefill_chunk=self.args.prefill_chunk,
+            checkpoint=self.args.checkpoint,
+            transcribe=narrate.transcribe)
+        self.voices[name] = prefix
+        if self.default_voice is None:
+            self.default_voice = name
+            voicelib.set_default(name)
+        return info
+
+    def drop_voice(self, name: str) -> dict:
+        """Unload a voice and delete it from disk.
+
+        ⚠️ Unloads from memory too. Deleting only the files would leave the
+        running server still answering for a voice the user believes is
+        gone -- which, for state derived from somebody's recorded voice, is
+        the wrong way round to fail.
+        """
+        import voices as voicelib
+        if name not in self.voices and name not in voicelib.names():
+            raise ValueError(f"no voice named {name!r}; have: "
+                             f"{', '.join(sorted(self.voices)) or '(none)'}")
+        self.voices.pop(name, None)
+        voicelib.remove(name)
+        if self.default_voice == name:
+            self.default_voice = voicelib.get_default()
+        return {"removed": name,
+                "voices": sorted(self.voices),
+                "default": self.default_voice}
+
+    def pick_voice(self, name: str | None):
+        """Resolve a request's `voice` to a prefix, or raise for a bad name.
+
+        Falls back to the process's own --ref clip, so a server started the
+        old way behaves exactly as before and `voice` stays optional.
+        """
+        if name and name in self.voices:
+            return self.voices[name]
+        if name and name not in ("drama3", "default", ""):
+            known = ", ".join(sorted(self.voices)) or "(none registered)"
+            raise ValueError(f"unknown voice {name!r}; have: {known}")
+        if self.default_voice and self.default_voice in self.voices:
+            return self.voices[self.default_voice]
+        return self.prefix
+
+    def speak(self, text: str, voice: str | None = None) -> np.ndarray:
         """One paragraph in, one waveform out. Caller holds GPU."""
         args, cfg = self.args, self.cfg
         dur, con = cfg.checks.duration, cfg.checks.content
+        chosen = self.pick_voice(voice)
+        # ⚠️ The prompt MUST be built from the same reference as the prefix
+        # it will resume from: generate_drama3_prefix checks that the
+        # prompt's head equals the snapshot's rows, so mixing a voice's
+        # prefix with another's prompt is a hard failure, not a subtle one.
+        texts = getattr(chosen, "prompt_texts", self.prompt_texts)
+        tokens = getattr(chosen, "prompt_tokens", self.prompt_tokens)
         pieces = internal_pieces(text, cfg.splitting.para_max_bytes)
         out = []
         for piece in pieces:
             prompt = build_drama3_prompt(piece, self.model.tokenizer,
-                                         self.model.config,
-                                         self.prompt_texts, self.prompt_tokens)
+                                         self.model.config, texts, tokens)
             budget = narrate.frame_budget(piece, cfg.splitting.max_new_tokens)
             expected = len(piece.encode()) / narrate.BYTES_PER_SECOND
             best = None
             for attempt in range(cfg.checks.max_attempts):
                 if attempt:
                     budget = cfg.splitting.max_new_tokens
-                if self.prefix is not None:
+                if chosen is not None:
                     frames, _ = prefix_kv.generate_drama3_prefix(
-                        self.model, prompt, self.prefix, max_new_tokens=budget,
+                        self.model, prompt, chosen, max_new_tokens=budget,
                         temperature=cfg.sampling.temperature, top_p=cfg.sampling.top_p,
                         top_k=cfg.sampling.top_k,
                         prefill_chunk_size=args.prefill_chunk)
@@ -499,7 +594,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"object": "list", "data": [
                 {"id": "drama-3", "object": "model", "owned_by": "fishaudio"}]})
             return
+        if self.path.rstrip("/") == "/v1/voices":
+            # Not in the OpenAI spec, but the shape openedai-speech and
+            # Kokoro-FastAPI use, so clients that look for voices already
+            # know how to read it. Without this a caller has no way to
+            # discover a name short of being told one.
+            eng = self.engine
+            names = sorted(eng.voices)
+            self._json(200, {"voices": [
+                {"id": n, "default": n == eng.default_voice} for n in names]
+                or [{"id": "drama3", "default": True}]})
+            return
         if self.path.rstrip("/") in ("/health", "/healthz", ""):
+            STATE["voices"] = sorted(self.engine.voices) if self.engine else []
+            STATE["default_voice"] = (self.engine.default_voice
+                                      if self.engine else None)
             uptime = time.time() - STATE["started"]
             rtf = (STATE["generate_seconds"] / STATE["audio_seconds"]
                    if STATE["audio_seconds"] else None)
@@ -518,6 +627,63 @@ class Handler(BaseHTTPRequestHandler):
         #   /tts_to_audio      XTTS-api-server. Field "text", wav.
         #   /tts               this project's own. Field "text", wav.
         route = self.path.rstrip("/") or "/"
+
+        # ⚠️ An ADMIN route, deliberately not under /v1: OpenAI has no
+        # voice-creation call, and inventing one under its namespace would
+        # make a client think this is part of the standard. The public API
+        # stays exactly what everyone else implements.
+        if route == "/admin/voices":
+            try:
+                length = int(self.headers.get("content-length", 0))
+                body = json.loads(self.rfile.read(length) or b"{}")
+                name = (body.get("name") or "").strip()
+                clip = (body.get("clip") or "").strip()
+            except Exception as exc:                       # noqa: BLE001
+                self._json(400, {"error": f"bad request: {exc}"})
+                return
+            if not name or not clip:
+                self._json(400, {"error": "need 'name' and 'clip'"})
+                return
+            started = time.perf_counter()
+            try:
+                # Queued behind generation, not run beside it: prefilling
+                # writes the same KV caches a decode reads.
+                with GPU:
+                    info = self.engine.add_voice(
+                        name, clip, body.get("ref_text"),
+                        body.get("ref_seconds"))
+            except ValueError as exc:
+                self._json(400, {"error": str(exc)})
+                return
+            except Exception as exc:                       # noqa: BLE001
+                log(f"addvoice {name!r} FAILED: {type(exc).__name__}: {exc}")
+                self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
+                return
+            info["elapsed"] = round(time.perf_counter() - started, 2)
+            log(f"voice {name!r} added live in {info['elapsed']:.1f}s "
+                f"({info['bytes']/2**20:.0f} MiB, {info['rows']} rows)")
+            self._json(200, info)
+            return
+
+        if route == "/admin/voices/remove":
+            try:
+                length = int(self.headers.get("content-length", 0))
+                name = (json.loads(self.rfile.read(length) or b"{}")
+                        .get("name") or "").strip()
+            except Exception as exc:                       # noqa: BLE001
+                self._json(400, {"error": f"bad request: {exc}"})
+                return
+            try:
+                # No GPU work: dropping a reference and deleting files.
+                info = self.engine.drop_voice(name)
+            except ValueError as exc:
+                self._json(400, {"error": str(exc)})
+                return
+            log(f"voice {name!r} removed; now: "
+                f"{', '.join(info['voices']) or '(none)'}")
+            self._json(200, info)
+            return
+
         if route not in ("/tts", "/tts_to_audio", "/v1/audio/speech"):
             self._json(404, {"error": "POST /v1/audio/speech, /tts or /tts_to_audio"})
             return
@@ -532,6 +698,7 @@ class Handler(BaseHTTPRequestHandler):
                    or payload.get("format")
                    or ("mp3" if openai else "wav")).lower()
             speed = float(payload.get("speed") or 1.0)
+            voice = (payload.get("voice") or "").strip() or None
         except Exception as exc:
             self._json(400, {"error": f"bad request: {exc}"})
             return
@@ -545,12 +712,21 @@ class Handler(BaseHTTPRequestHandler):
         if not 0.25 <= speed <= 4.0:
             self._json(400, {"error": f"speed {speed} outside 0.25-4.0"})
             return
+        # ⚠️ Validate the voice BEFORE taking the GPU lock. An unknown name
+        # is the client's typo, answerable in microseconds; discovering it
+        # after queueing behind a 20 s generation would make a 400 look
+        # like a performance problem.
+        try:
+            self.engine.pick_voice(voice)
+        except ValueError as exc:
+            self._json(400, {"error": str(exc)})
+            return
         started = time.perf_counter()
         try:
             # Serialised: one model, one set of KV caches. Concurrent
             # generations would interleave into the same buffers.
             with GPU:
-                audio = self.engine.speak(text)
+                audio = self.engine.speak(text, voice)
         except Exception as exc:
             log(f"FAILED {len(text.encode())}B: {type(exc).__name__}: {exc}")
             self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
@@ -593,6 +769,8 @@ def main() -> None:
     ap.add_argument("--slice-lm-head", action="store_true", default=True)
     ap.add_argument("--offload-embed", action="store_true", default=True)
     ap.add_argument("--prefix-kv", action="store_true", default=True)
+    ap.add_argument("--no-voices", dest="voices", action="store_false",
+                    default=True, help="ignore voices/ and use --ref only")
     # Switches that override a config section wholesale, for a one-off run
     # without editing the file.
     ap.add_argument("--no-verify-stt", action="store_true",

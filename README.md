@@ -448,6 +448,46 @@ That is the whole protocol. Any reader, script or pipeline that can POST
 JSON and play wav will work; `drama3ctl config` happens to print a ready-made
 config block for the one this was developed against.
 
+### Named voices
+
+One reference clip per process was the old limit. A voice is now a stored
+prefix-KV snapshot — 118 MiB of prefilled state — so several live in one
+server and a request picks between them with the standard `voice` field.
+
+```bash
+bin/drama3-offloading --addvoice narrator /path/to/clip.mp3
+bin/drama3-offloading --voices
+bin/drama3-offloading --defaultvoice narrator
+```
+
+```bash
+curl localhost:8123/v1/audio/speech -H 'Content-Type: application/json' \
+  -d '{"model":"drama-3","input":"...","voice":"narrator"}'
+```
+
+**Measured:** a voice restored from disk scores **0.9400** timbre against
+its reference clip, against **0.9426** for the same clip prefilled live in
+the same process — a gap well inside the 0.907–0.953 run-to-run spread at
+temperature 1.0. `bin/test_prefix_persist.py` checks the stronger claim:
+107/107 tensors bit-identical, including a control proving the build is
+reproducible across processes in the first place.
+
+⚠️ **`--addvoice` stops the server if it is running**, because building a
+voice needs ~20 GiB and so does the server; a 24 GiB card holds one of
+them. It restarts afterwards. This is deliberate — the alternative is an
+OOM in whichever process loses, which looks like a bug rather than a
+resource conflict.
+
+⚠️ **A voice whose fingerprint does not match is skipped with a reason,
+never restored.** Torch version, weights identity, prefill chunk size and
+cache capacity all have to agree. Restoring state built against different
+weights would produce fluent audio in the wrong voice, and no downstream
+check would catch it.
+
+⚠️ `voices/` is **gitignored**. A snapshot is not audio, but it exists
+solely to reproduce someone's voice — the same personal data in a
+different format.
+
 ### Why the interfaces are boring on purpose
 
 Both ends of this project speak interfaces somebody else defined — OpenAI

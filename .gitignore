@@ -1,11 +1,16 @@
 # Never in this repo, and never in its history:
 #   source clips/   a real person's voice recording
 #   out/            generated speech in that voice
+#   voices/         prefix-KV snapshots -- DERIVED from a voice recording.
+#                   118 MiB of prefilled model state per voice: not audio,
+#                   but it exists only to reproduce someone's voice, so it
+#                   is the same personal data wearing a different format.
 #   test script/    third-party documentation, not ours to redistribute
 # Excluded from the first commit rather than removed later, because taking a
 # file out of git history means rewriting it.
 source clips/
 out/
+voices/
 test script/
 
 venv/
