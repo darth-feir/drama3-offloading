@@ -44,7 +44,14 @@ def read(name: str) -> str:
 def code_text() -> str:
     """Every python source plus the control script, concatenated."""
     out = []
+    # ⚠️ Shell scripts too, not just *.py. This scanned python plus
+    # drama3ctl and therefore could not see flags defined in setup.sh --
+    # it reported --yes and --no-weights as undocumented inventions when
+    # both were real. A checker that only half-knows the codebase
+    # produces false alarms, which is how checkers get ignored.
     for p in sorted((HOME / "bin").glob("*.py")):
+        out.append(p.read_text())
+    for p in sorted((HOME / "bin").glob("*.sh")):
         out.append(p.read_text())
     ctl = HOME / "bin" / "drama3ctl"
     if ctl.is_file():

@@ -146,75 +146,81 @@ against the 80 these measurements used. 16 GB is where it stops hurting.
 ## Setup
 
 ```bash
-# 1. fish-speech, used UNMODIFIED and not vendored here.
-#    ⚠️ CHECK OUT THE PINNED COMMIT. Everything in bin/ hooks this at
-#    runtime and upstream moves; "verified against" is worth nothing
-#    without the checkout.
-git clone https://github.com/fishaudio/fish-speech
-git -C fish-speech checkout 5415669
-
 git clone https://github.com/darth-feir/drama3-offloading.git
 cd drama3-offloading
-
-# 2. a python 3.12 venv.
-#    On NixOS there is no python3.12 on PATH; see the NixOS note below.
-python3.12 -m venv venv
-
-# ⚠️ --no-deps is deliberate. fish-speech declares 27 dependencies, one of
-#    which is pyaudio -- it needs a C compiler and portaudio headers, it
-#    fails to build without them, and nothing here records audio. The list
-#    below is what this project actually imports, established by installing
-#    nothing and adding whatever raised ImportError until it ran.
-# ⚠️ --no-deps is why the NEXT command prints ~15 red
-#    "ERROR: fish-speech 3.0.0 requires ..." lines: pip resolves them
-#    only once requirements.txt is installed over the top. Correct, and
-#    alarming. Keep going.
-venv/bin/pip install -e ../fish-speech --no-deps
-# requirements.txt is the exact set every measurement here was taken on.
-venv/bin/pip install -r requirements.txt
-
-# 3. the weights: 36.9 GiB + a 1.87 GiB codec. Set HF_HOME first if you
-#    do not want them in ~/.cache.
-export HF_HOME=/somewhere/with/40GB
-
-# ⚠️ Disable xet unless you like silence. Without this the download can
-#    sit at ~4.5 kB/s with NO error on stdout -- the failures go to
-#    $HF_HOME/xet/logs/. Measured in a clean room: 18 minutes and zero
-#    progress, then ~35 MB/s and done in 17 once xet was off.
-export HF_HUB_DISABLE_XET=1
-venv/bin/hf download fishaudio/drama-3   # 'huggingface-cli' in hub < 1.0
-
-# ⚠️ If you interrupt a download, `hf` leaves .incomplete blobs behind and
-#    never reaps them -- a killed first attempt left 44 G on disk for a
-#    39 G snapshot. Delete $HF_HOME/hub/**/blobs/*.incomplete by hand.
-
-# 4. environment. Defaults assume ../fish-speech and find the weights
-#    under HF_HOME; override DRAMA3_FISH / DRAMA3_CKPT if not.
-source bin/env.sh
-
-# 5. check the machine before trusting any of the above.
-venv/bin/python bin/doctor.py
+./bin/setup.sh
 ```
 
-**Run `bin/doctor.py` as soon as the venv exists** — it is numbered 5
-because it needs the venv, but everything it checks except the weights
-is worth knowing *before* you start the 38 GiB download in step 3. Run
-it twice: once after step 2, once at the end.
-It checks python, the torch import, CUDA visibility, compute capability,
-VRAM, RAM, every import, ffmpeg, the compiler, where the weights resolve
-to, whether the extension cache is writable, and the STT endpoint — and
-prints the fix beside whatever is wrong. Exit 0 all clear, 1 a failure,
-2 warnings only.
+That clones `fish-speech` beside this repo at its pinned commit, builds a
+Python 3.12 venv, installs the exact versions every measurement here was
+taken on, offers to fetch the 38 GiB of weights, and finishes by running
+`bin/doctor.py` against your machine. Re-running it is safe; every step
+checks before acting.
 
-Every blocker found in two clean-room builds cost 20–40 minutes and would
-have been one line of its output.
+```
+./bin/setup.sh --yes          # no prompts
+./bin/setup.sh --no-weights   # you already have them, or want them later
+```
 
-`bin/env.sh` documents every variable it reads and why. Most people need
-none of them.
+⚠️ **It will not download 38 GiB without asking.** Non-interactive runs
+are treated as "no" and it prints the command to run later.
+
+⚠️ **It will not overwrite your work.** If `fish-speech` is at a
+different commit *with local changes*, it says so and leaves it alone
+rather than checking out over your edits.
+
+Three steps in there exist only because of traps found the hard way, and
+are worth knowing even though the script now handles them:
+
+| | |
+|---|---|
+| `git checkout 5415669` | upstream moves. "Verified against" is worth nothing without the checkout |
+| `pip install --no-deps` | fish-speech declares `pyaudio`: needs portaudio headers, fails to build, and nothing here records audio. Expect ~15 red `ERROR: fish-speech 3.0.0 requires ...` lines from the *next* install — correct, and alarming |
+| `HF_HUB_DISABLE_XET=1` | without it the download can sit at **4.5 kB/s with no error on stdout** — 18 minutes of silence in a clean-room run, failures hidden in `$HF_HOME/xet/logs/`. With it: ~35 MB/s |
+
+⚠️ If you interrupt a download, `hf` leaves `.incomplete` blobs behind and
+never reaps them — a killed attempt left 44 G on disk for a 39 G
+snapshot. Delete `$HF_HOME/hub/**/blobs/*.incomplete` by hand.
+
+### Speech-to-text (optional, but read this)
+
+The content check that catches **fluent gibberish** — nonsense at the
+right duration, which every other check is blind to by construction —
+needs an OpenAI-compatible `/v1/audio/transcriptions` endpoint.
+
+Already run one? Point at it and you are done:
+
+```bash
+export DRAMA3_STT=http://127.0.0.1:8080
+```
+
+Don't have one? The second script installs a local one:
+
+```bash
+./bin/setup-stt.sh
+```
+
+It exits immediately if something already answers on the port. It
+installs `parakeet-api` serving NVIDIA Parakeet TDT 0.6B v2 int8 on
+sherpa-onnx, CPU — measured RTF ~0.04, ~0.17 s per check.
+
+**The endpoint is what matters, not the engine.** whisper.cpp's server,
+faster-whisper-server and LocalAI all work; that script exists so "I
+don't have one" is not a dead end.
+
+⚠️ **CPU on purpose.** ONNX Runtime's CUDA provider measured *slower*
+than CPU for this model — 520 ms against 426 ms — and CPU means
+transcription survives the TTS server owning the GPU.
+
+### Doing it by hand
+
+`./bin/setup.sh` is twelve commands in a trenchcoat; read it if you want
+them. `bin/env.sh` documents every variable the project reads and why.
+Most people need none of them.
 
 ⚠️ **The checkout must be writable.** `torch-ext-cache/` is built next to
-the code and, unlike `DRAMA3_RUN`, has no override — a read-only clone
-cannot build the extension.
+the code — set `DRAMA3_EXT_CACHE` if your clone is read-only.
+
 
 ### ⚠️ If you are on NixOS
 
@@ -662,6 +668,8 @@ bin/test_*.py        correctness: bit-identity of every lossless transform
 bin/prefill_probe.py measure where a prefill batch's time actually goes
 bin/server.py        resident HTTP server; one model load, many requests
 bin/drama3ctl        start|stop|restart|status|log|config for that server
+bin/setup.sh         clone, venv, deps, weights, doctor -- the whole install
+bin/setup-stt.sh     OPTIONAL local speech-to-text, if you have none
 bin/cleanroom.sh     build a fresh venv and check the setup above still works
 bin/doctor.py        preflight: can this machine run it, and what is missing
 bin/check_docs.py    do the docs still name flags, keys, routes and files that exist
