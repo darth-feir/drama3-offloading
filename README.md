@@ -297,6 +297,13 @@ head -8 *.trans.txt | cut -d' ' -f2- | tr '\n' ' ' > ../../../../myvoice.txt
 ⚠️ A 337 MB corpus download to obtain one clip is heavy. A single
 LibriVox MP3 is far smaller if you only want to hear it work.
 
+⚠️ **Longer than ~60 s may not build**, and the limit is VRAM headroom
+during prefill rather than anything about the clip. At the default
+`--vram-reserve 2` a 90 s clip fails with a CUDA OOM; at `--vram-reserve
+5` it builds fine, because the expert cache shrinks and leaves room. The
+headroom is only needed to *build* — a 90 s voice built at reserve 5
+loads and serves at reserve 2. See `notes/18-named-voices.md`.
+
 **`--ref-text` matters less than this README used to claim.** With an STT
 endpoint set it is transcribed for you; a corpus transcript is better
 still.
@@ -451,13 +458,15 @@ config block for the one this was developed against.
 ### Named voices
 
 One reference clip per process was the old limit. A voice is now a stored
-prefix-KV snapshot — 118 MiB of prefilled state — so several live in one
-server and a request picks between them with the standard `voice` field.
+prefix-KV snapshot — about **1.7 MiB per second** of reference, so 94 MiB
+for a 28 s clip and 157 MiB for 85 s — and several live in one server,
+selected by the standard `voice` field.
 
 ```bash
 bin/drama3-offloading --addvoice narrator /path/to/clip.mp3
 bin/drama3-offloading --voices
 bin/drama3-offloading --defaultvoice narrator
+bin/drama3-offloading --delvoice narrator
 ```
 
 ```bash
@@ -472,11 +481,27 @@ temperature 1.0. `bin/test_prefix_persist.py` checks the stronger claim:
 107/107 tensors bit-identical, including a control proving the build is
 reproducible across processes in the first place.
 
-⚠️ **`--addvoice` stops the server if it is running**, because building a
-voice needs ~20 GiB and so does the server; a 24 GiB card holds one of
-them. It restarts afterwards. This is deliberate — the alternative is an
-OOM in whichever process loses, which looks like a bug rather than a
-resource conflict.
+**Adding a voice to a running server takes ~3 s and needs no restart.**
+`--addvoice` asks the server to build it with the model already loaded,
+queued behind whatever it is doing. With the server stopped it loads a
+model of its own instead, which costs the usual ~65 s.
+
+⚠️ It used to stop and restart the server (~70 s) because the builder
+loaded a *second* copy of the model and two will not fit on a 24 GiB
+card. That was an artifact of writing the builder standalone, not a real
+constraint.
+
+**Voices live in pinned host RAM, not VRAM.** Measured on a 125 MiB
+snapshot: restoring costs 5.07 ms from pinned host memory against 0.54 ms
+from VRAM — +4.5 ms on a ~16 s generation, or 0.03 %, paid once per chunk.
+In exchange the card keeps 125 MiB per voice, and VRAM is what runs out
+here. Budget is **1 GiB, growing a gigabyte at a time**: nothing is ever
+refused, but crossing a step prints a breakdown at boot, because pinned
+pages cannot be swapped.
+
+**`--delvoice` moves the voice to `voices/.trash/`**, it does not erase
+it. Recovery is a file move rather than a GPU rebuild — which matters,
+because a rebuild only works while the original clip still exists.
 
 ⚠️ **A voice whose fingerprint does not match is skipped with a reason,
 never restored.** Torch version, weights identity, prefill chunk size and

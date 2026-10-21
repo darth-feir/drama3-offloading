@@ -42,6 +42,40 @@ def voices_dir() -> Path:
     return Path(os.environ.get("DRAMA3_VOICES", HOME / "voices"))
 
 
+# ⚠️ Voices live in PINNED HOST RAM, not VRAM.
+#
+# They were on the card at first for no better reason than that a
+# freshly-built prefix is cloned from GPU caches and the loader mirrored
+# it. Measured on a real 125 MiB snapshot:
+#
+#     VRAM-resident      0.54 ms   226.6 GiB/s
+#     host RAM, pinned   5.07 ms    24.1 GiB/s   <- at the PCIe roof
+#     host RAM, pageable 9.02 ms    13.5 GiB/s
+#
+# So host RAM costs +4.5 ms per request against a ~16 s generation:
+# 0.03 %, well under run-to-run variance, and paid once per chunk rather
+# than per token. In exchange each voice stops taking 125 MiB off a
+# 24 GiB card -- VRAM being the resource that actually runs out here (the
+# reference-length wall is prefill headroom, and this benchmark itself
+# OOM'd on the first attempt because the server held the card).
+#
+# Pinned rather than pageable: 5.07 vs 9.02 ms for free, same reason
+# --pin-experts pins the expert tables. Pinned pages cannot be swapped,
+# so the budget below exists to keep that honest.
+BUDGET_STEP = 1 << 30          # 1 GiB
+
+
+def budget_for(total_bytes: int) -> int:
+    """How much host RAM we have agreed to spend on voices.
+
+    One gigabyte, growing a gigabyte at a time. Twenty voices simply eat
+    more RAM rather than hitting a wall -- but crossing a step is worth
+    saying out loud, because this memory is locked and cannot be swapped.
+    """
+    steps = max(1, -(-int(total_bytes) // BUDGET_STEP))
+    return steps * BUDGET_STEP
+
+
 def _digest(t: torch.Tensor) -> str:
     return hashlib.sha256(
         t.detach().to("cpu").contiguous().view(torch.uint8).numpy().tobytes()
@@ -189,7 +223,7 @@ def names() -> list[str]:
     d = voices_dir()
     if not d.is_dir():
         return []
-    return sorted(p.stem for p in d.glob("*.json"))
+    return sorted(p.stem for p in d.glob("*.json") if p.parent == d)
 
 
 def meta(name: str) -> dict:
@@ -214,12 +248,33 @@ def set_default(name: str) -> None:
     (d / "default").write_text(name + "\n")
 
 
-def remove(name: str) -> None:
+def remove(name: str) -> Path | None:
+    """Move a voice to voices/.trash/ rather than erasing it.
+
+    ⚠️ This used to unlink. An unauthenticated POST deleted a real voice
+    during a CORS audit -- 125 MiB of state derived from someone's
+    recording, gone, with the only recovery being a GPU rebuild that
+    needs the original clip to still exist. A voice is personal data; an
+    accidental delete should cost a file move, not a recording.
+
+    Returns where it went, or None if there was nothing to move.
+    """
     d = voices_dir()
+    trash = d / ".trash"
+    moved = None
     for suffix in (".pt", ".json"):
-        (d / f"{name}{suffix}").unlink(missing_ok=True)
+        src = d / f"{name}{suffix}"
+        if not src.exists():
+            continue
+        trash.mkdir(parents=True, exist_ok=True)
+        dst = trash / f"{name}{suffix}"
+        if dst.exists():                      # keep the older copy too
+            dst = trash / f"{name}.{int(src.stat().st_mtime)}{suffix}"
+        src.replace(dst)
+        moved = trash
     if (d / "default").is_file() and (d / "default").read_text().strip() == name:
         (d / "default").unlink()
+    return moved
 
 
 def load_into(name: str, model, prefix_cls, checkpoint: str | Path,
@@ -263,16 +318,27 @@ def load_into(name: str, model, prefix_cls, checkpoint: str | Path,
                       f"now {len(full)}/{len(gdn)}/{len(towers)}")
 
     device = next(model.parameters()).device
-    def grab(key: str) -> torch.Tensor:
+
+    def host(key: str) -> torch.Tensor:
+        """Stays on the host, pinned. restore() copies it in."""
+        t = payload[key]
+        return t.pin_memory() if not t.is_pinned() else t
+
+    def gpu(key: str) -> torch.Tensor:
         return payload[key].to(device, non_blocking=True)
 
-    prefix.carry = grab("carry")
-    prefix.backbone_kv = [(m, grab(f"backbone.{i}.k"), grab(f"backbone.{i}.v"))
+    # ⚠️ carry goes to the DEVICE, not the host: generate_drama3_prefix
+    # does torch.cat((carry, hidden)) against GPU hidden states. It is one
+    # row, so keeping it resident costs nothing. Everything else is only
+    # ever copy_'d into a cache and can live on the host.
+    prefix.carry = gpu("carry")
+    prefix.backbone_kv = [(m, host(f"backbone.{i}.k"), host(f"backbone.{i}.v"))
                           for i, m in enumerate(full)]
-    prefix.gdn = [(m, grab(f"gdn.{i}.conv"), grab(f"gdn.{i}.recurrent"))
+    prefix.gdn = [(m, host(f"gdn.{i}.conv"), host(f"gdn.{i}.recurrent"))
                   for i, m in enumerate(gdn)]
-    prefix.tower_kv = [(m, grab(f"tower.{i}.k"), grab(f"tower.{i}.v"))
+    prefix.tower_kv = [(m, host(f"tower.{i}.k"), host(f"tower.{i}.v"))
                        for i, m in enumerate(towers)]
+    prefix.host_resident = True
     prefix._buffer_ids = prefix._buffer_identity()
     prefix.bytes = int(info["bytes"])
     prefix.prompt_texts = (info["ref_text"],)

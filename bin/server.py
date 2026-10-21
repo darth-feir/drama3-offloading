@@ -378,6 +378,7 @@ class Engine:
             if self.voices:
                 log(f"voices: {', '.join(sorted(self.voices))}"
                     f"  default={self.default_voice or '--ref'}")
+                self._report_voice_memory(voicelib)
         self.default_voice = getattr(self, "default_voice", None)
 
         # ⚠️ Warm up HERE, on the main thread, before the server starts.
@@ -401,6 +402,32 @@ class Engine:
         STATE["ready"] = True
         log(f"ready in {STATE['load_seconds']:.0f}s")
 
+    def _report_voice_memory(self, voicelib) -> None:
+        """Account for the pinned host RAM voices hold.
+
+        ⚠️ Quiet under a gigabyte, LOUD above it. The budget grows a
+        gigabyte at a time so twenty voices just use more RAM rather than
+        hitting a wall -- but this memory is page-locked and cannot be
+        swapped, so silently holding several gigabytes of it is the kind
+        of thing that should never be a surprise.
+        """
+        total = sum(v.bytes for v in self.voices.values())
+        budget = voicelib.budget_for(total)
+        gib = total / 2**30
+        if budget <= voicelib.BUDGET_STEP:
+            log(f"voices: {gib*1024:.0f} MiB pinned host RAM "
+                f"(budget {budget/2**30:.0f} GiB)")
+            return
+        log("=" * 62)
+        log(f"VOICES ARE USING {gib:.2f} GiB OF PINNED HOST RAM")
+        log(f"  budget grown to {budget/2**30:.0f} GiB "
+            f"({len(self.voices)} voices)")
+        for name in sorted(self.voices, key=lambda n: -self.voices[n].bytes):
+            log(f"    {name:<20} {self.voices[name].bytes/2**20:6.0f} MiB")
+        log("  Pinned memory cannot be swapped. Remove voices you do not")
+        log("  need:  bin/drama3-offloading --delvoice NAME")
+        log("=" * 62)
+
     def add_voice(self, name: str, clip: str, ref_text: str | None,
                   ref_seconds: float | None) -> dict:
         """Build and register a voice using the model already loaded here.
@@ -420,6 +447,7 @@ class Engine:
             checkpoint=self.args.checkpoint,
             transcribe=narrate.transcribe)
         self.voices[name] = prefix
+        self._report_voice_memory(voicelib)
         if self.default_voice is None:
             self.default_voice = name
             voicelib.set_default(name)
@@ -438,7 +466,9 @@ class Engine:
             raise ValueError(f"no voice named {name!r}; have: "
                              f"{', '.join(sorted(self.voices)) or '(none)'}")
         self.voices.pop(name, None)
-        voicelib.remove(name)
+        trashed = voicelib.remove(name)
+        if trashed:
+            log(f"voice {name!r} moved to {trashed} (not erased)")
         if self.default_voice == name:
             self.default_voice = voicelib.get_default()
         return {"removed": name,

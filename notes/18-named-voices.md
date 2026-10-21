@@ -35,19 +35,64 @@ same clip prefilled live in the same process. The gap sits inside the
 
 Prefilled state plus what is needed to decide whether reusing it is safe.
 
-⚠️ **It lives in VRAM, not host RAM** — an earlier draft of this note said
-host RAM and was wrong. `voices.load_into()` does `.to(device)`, so every
-loaded voice sits on the card for the life of the process. Measured:
+Size scales with the reference, at about **1.7 MiB per second**:
 
-| reference | rows | resident |
+| reference | rows | snapshot |
 |---|---|---|
 | 28.5 s | 734 | **94 MiB** |
 | 56 s | 1416 | **125 MiB** |
 | 84.5 s | 2120 | **157 MiB** |
 
-About **1.7 MiB per second** of reference. Four 60-second voices is
-~500 MiB of VRAM: small against 24 GB, but not the free lunch "host RAM"
-implied, and a real cost on a smaller card.
+### Where it lives: pinned host RAM
+
+⚠️ **This note has now been wrong in both directions.** The first draft
+said host RAM when the loader did `.to(device)`; the correction said VRAM;
+the right answer, once someone asked *why* it had to be on the card, was
+that it never did. `restore()` only ever `copy_`s into the model's caches,
+and a copy from host memory is an ordinary host-to-device transfer.
+
+Measured on the real 125 MiB snapshot:
+
+```
+VRAM-resident        0.54 ms   226.6 GiB/s
+host RAM, pinned     5.07 ms    24.1 GiB/s   <- at the PCIe roof
+host RAM, pageable   9.02 ms    13.5 GiB/s
+```
+
++4.5 ms per request against a ~16 s generation is **0.03 %**, paid once
+per chunk rather than per token. In exchange a voice stops costing
+125 MiB of a 24 GiB card — and VRAM is what actually runs out here: the
+reference-length wall is prefill headroom, and the benchmark above OOM'd
+on its first attempt purely because the server held the card. Freed VRAM
+becomes expert cache, which `10` measured at roughly 1.94 GiB ≈ 2.5 % RTF.
+
+⚠️ **`carry` stays on the GPU.** `generate_drama3_prefix` does
+`torch.cat((carry, hidden))` against GPU hidden states, so a host-resident
+carry breaks generation. It is one row.
+
+⚠️ Pinned rather than pageable — 5.07 vs 9.02 ms for free, the same
+reason `--pin-experts` pins the expert tables. Pinned pages cannot be
+swapped, which is what the budget below is for.
+
+### The budget: 1 GiB, growing a gigabyte at a time
+
+Nothing is ever refused. Twenty voices simply use more RAM. But crossing
+a gigabyte prints a banner at boot and after any live add — total, count,
+a per-voice breakdown and the `--delvoice` command — because several
+gigabytes of unswappable memory should never be a surprise.
+
+```
+0.12 GiB -> budget 1 GiB   quiet
+0.88 GiB -> budget 1 GiB   quiet
+1.20 GiB -> budget 2 GiB   LOUD
+2.50 GiB -> budget 3 GiB   LOUD   (twenty voices)
+```
+
+⚠️ **Honest about the cost:** RTF measured 0.816/0.818 host-resident
+against 0.783 in VRAM for the same voice — ~4 %, not the 0.03 % the copy
+benchmark predicts. n=2 per arm, and that same voice spanned 0.764–0.801
+across runs earlier, so it sits inside the noise. A small real regression
+cannot be ruled out; the VRAM saving is still worth it.
 
 **Order is the contract.** A live snapshot holds module references —
 `(module, k, v)` — which cannot be serialised. On reload the tensors are
@@ -125,8 +170,17 @@ told it was a typo.
 
 ## Removal
 
-`--delvoice` unloads from memory **and** deletes from disk, and reassigns
-the default if it removed it. Deleting only the files would leave the
+`--delvoice` unloads from memory and **moves the files to
+`voices/.trash/`** rather than erasing them, reassigning the default if it
+removed it.
+
+⚠️ It used to unlink. An unauthenticated `POST /admin/voices/remove`
+destroyed a real voice during a CORS audit — the auditor fired the
+destructive request to observe a *response header*. 125 MiB of state
+derived from someone's recording, gone, with recovery requiring a GPU
+rebuild that only works while the original clip still exists. CORS
+exclusion does not help here: the caller was not a browser. An accidental
+delete should cost a file move, not a recording. Deleting only the files would leave the
 running server answering for a voice the user believes is gone, which for
 state derived from somebody's recorded voice is the wrong way round to
 fail.
