@@ -74,7 +74,20 @@ export TORCHINDUCTOR_CACHE_DIR TRITON_CACHE_DIR
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
 
 # --- NixOS only -------------------------------------------------------
-if [ -e /etc/NIXOS ] || [ -d /run/opengl-driver/lib ]; then
+# ⚠️ /etc/NIXOS, and ONLY that. Two weaker tests were tried and both
+# gave false positives inside a GPU container on Ubuntu:
+#
+#   /run/opengl-driver/lib  the nvidia-container-toolkit CREATES it in
+#                           the container, on any distro
+#   /nix/store              on NixOS the toolkit MOUNTS the driver libs
+#                           from the store, so the container has one too
+#
+# Either way an Ubuntu container printed "no libstdc++.so.6 found in
+# /nix/store; torch will not import" while torch imported perfectly
+# well -- harmless, alarming, and exactly the sort of message that costs
+# somebody an evening. /etc/NIXOS is present on the host and absent in
+# the container, which is the distinction that actually matters.
+if [ -e /etc/NIXOS ]; then
     # PyPI CUDA wheels are not patchelf'd. Without this,
     # torch.cuda.is_available() returns False SILENTLY and everything runs
     # on the CPU -- no error, just 50x slower.
