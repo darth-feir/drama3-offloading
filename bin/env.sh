@@ -8,6 +8,24 @@
 DRAMA3_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export DRAMA3_HOME
 
+# --- your machine's answers, if you have written them down -------------
+# bin/env.local is sourced FIRST so it wins: every default below uses
+# := and therefore defers to anything already set.
+#
+# It exists because a checkout that does not sit beside its venv,
+# fish-speech and weights needs several exports, and typing them before
+# every start is the kind of friction that gets a project called fiddly.
+# Write them once:
+#
+#   cp bin/env.local.example bin/env.local   # then edit
+#
+# ⚠️ GITIGNORED on purpose. It holds absolute paths from one machine --
+# and possibly a path to somebody's voice recording.
+if [ -f "$DRAMA3_HOME/bin/env.local" ]; then
+    # shellcheck disable=SC1091
+    source "$DRAMA3_HOME/bin/env.local"
+fi
+
 # --- required ---------------------------------------------------------
 # A clean checkout of github.com/fishaudio/fish-speech. NOT forked and NOT
 # patched: everything in bin/ hooks it at runtime. Verified at 5415669.

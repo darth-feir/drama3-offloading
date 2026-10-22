@@ -323,28 +323,36 @@ class Engine:
         cap = devcache.install_dev_cache(self.model, device, cap)
         log(f"device cache: {cap} experts/layer")
 
-        # The reference, encoded once.
-        wav = Path(args.state_dir) / "reference.wav"
-        wav.parent.mkdir(parents=True, exist_ok=True)
-        seconds = cfg.voice.seconds
-        if seconds and cfg.voice.snap_to_silence:
-            seconds = narrate.snap_to_silence(Path(args.ref), seconds)
-        narrate.to_pcm16(Path(args.ref), wav, seconds)
-        ref_text = args.ref_text or cfg.voice.ref_text or narrate.transcribe(wav)
-        if not ref_text or ref_text.startswith("<stt"):
-            raise SystemExit(
-                f"no reference transcript ({ref_text!r}); pass --ref-text, "
-                "or set DRAMA3_STT and it will be transcribed for you. "
-                "An approximate transcript is far better than none: a wrong "
-                "one measured no worse on timbre or content (notes/17), but "
-                "the model still needs some text to align the clip against.")
-        self.prompt_texts = (ref_text,)
-        self.prompt_tokens = (encode_audio(wav, self.codec, device),)
-        log(f"reference: {self.prompt_tokens[0].shape[1]} codes "
-            f"({self.prompt_tokens[0].shape[1]/narrate.FRAME_RATE:.1f}s)")
+        # ⚠️ The reference clip is now OPTIONAL. Before named voices it
+        # was the only way to have a voice at all, so startup demanded it
+        # -- which outlived its reason: a server with a registered voice
+        # refused to boot without also being handed a clip it would never
+        # use. main() allows either; this block simply does nothing when
+        # there is no --ref.
+        self.prompt_texts = None
+        self.prompt_tokens = None
+        if args.ref:
+            wav = Path(args.state_dir) / "reference.wav"
+            wav.parent.mkdir(parents=True, exist_ok=True)
+            seconds = cfg.voice.seconds
+            if seconds and cfg.voice.snap_to_silence:
+                seconds = narrate.snap_to_silence(Path(args.ref), seconds)
+            narrate.to_pcm16(Path(args.ref), wav, seconds)
+            ref_text = args.ref_text or cfg.voice.ref_text or narrate.transcribe(wav)
+            if not ref_text or ref_text.startswith("<stt"):
+                raise SystemExit(
+                    f"no reference transcript ({ref_text!r}); pass --ref-text, "
+                    "or set DRAMA3_STT and it will be transcribed for you. "
+                    "An approximate transcript is far better than none: a wrong "
+                    "one measured no worse on timbre or content (notes/17), but "
+                    "the model still needs some text to align the clip against.")
+            self.prompt_texts = (ref_text,)
+            self.prompt_tokens = (encode_audio(wav, self.codec, device),)
+            log(f"reference: {self.prompt_tokens[0].shape[1]} codes "
+                f"({self.prompt_tokens[0].shape[1]/narrate.FRAME_RATE:.1f}s)")
 
         self.prefix = None
-        if args.prefix_kv:
+        if args.prefix_kv and args.ref:
             self.prefix = prefix_kv.make_prefix(
                 self.model, self.prompt_texts, self.prompt_tokens, args.prefill_chunk)
             log(f"prefix KV: {self.prefix.P} rows reused, "
@@ -353,6 +361,18 @@ class Engine:
             # one code path serves both; --ref is just the unnamed one.
             self.prefix.prompt_texts = self.prompt_texts
             self.prefix.prompt_tokens = self.prompt_tokens
+
+        # ⚠️ Allocate the KV caches BEFORE loading voices, and do it here
+        # rather than relying on make_prefix() to do it as a side effect.
+        # Without --ref that side effect never fired, so cache_capacity
+        # was still 0 when the fingerprint was checked and every voice
+        # was rejected with "stored 10240 != now 0" -- a real voice
+        # refused because of load ORDER, not because anything was stale.
+        from fish_speech.models.text2semantic.fish_omni.generate import (
+            ensure_drama3_caches, Drama3DecodeGraphs,
+        )
+        ensure_drama3_caches(self.model,
+                             Drama3DecodeGraphs.graph_capacity(self.model))
 
         # Named voices from voices/. Each is ~118 MiB of host RAM against
         # 30 GiB of pinned experts, so holding several costs nothing.
@@ -380,6 +400,18 @@ class Engine:
                     f"  default={self.default_voice or '--ref'}")
                 self._report_voice_memory(voicelib)
         self.default_voice = getattr(self, "default_voice", None)
+
+        # ⚠️ Fail here rather than on the first request. Without --ref the
+        # voices are the only thing that can speak, so if every one of
+        # them was skipped for a stale fingerprint the server would start
+        # happily and 500 on everything.
+        if self.prefix is None and not self.voices:
+            raise SystemExit(
+                "nothing to speak with: no --ref clip, and no usable voice "
+                "in voices/.\n"
+                "  bin/drama3-offloading --addvoice NAME /path/to/clip.mp3\n"
+                "If voices exist, check the log above -- each skipped one "
+                "says why (a fingerprint mismatch means rebuild it).")
 
         # ⚠️ Warm up HERE, on the main thread, before the server starts.
         #
@@ -956,7 +988,15 @@ def main() -> None:
     args.host = args.host or cfg.server.host
     args.port = args.port or cfg.server.port
     if not args.ref:
-        raise SystemExit("no reference clip: set --ref or voice.ref in config.toml")
+        # A registered voice is a reference clip that has already been
+        # prefilled, so requiring both is redundant.
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import voices as _voicelib
+        if not (args.voices and _voicelib.names()):
+            raise SystemExit(
+                "no voice available: set --ref (or voice.ref in "
+                "config.toml), or register one with\n"
+                "  bin/drama3-offloading --addvoice NAME /path/to/clip.mp3")
 
     log(f"config: {cfg._path}")
     log(config.describe(cfg))

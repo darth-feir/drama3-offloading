@@ -21,3 +21,6 @@ __pycache__/
 
 # Runtime state: pidfile, server log, the encoded reference.
 run/
+
+# Per-machine paths, possibly including a path to a voice recording.
+bin/env.local

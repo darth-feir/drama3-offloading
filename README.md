@@ -403,14 +403,28 @@ the reference clip's KV snapshot. Paying that per paragraph would be absurd,
 so it is a resident process.
 
 ```bash
-export DRAMA3_REF="/path/to/clip.mp3"
-export DRAMA3_REF_TEXT="exactly what the clip says"
-
-bin/drama3ctl start      # ~35 s
-bin/drama3ctl status
-bin/drama3ctl config     # prints the say backend block
-bin/drama3ctl stop
+bin/drama3-offloading --start     # ~35 s, then follows the log
+bin/drama3-offloading --status
+bin/drama3-offloading --config    # backend JSON for a client
+bin/drama3-offloading --stop
 ```
+
+**No environment variables are needed** once a voice is registered: the
+voice *is* the reference. `--ref` / `DRAMA3_REF` remains available as an
+unnamed fallback, and until 2026-10-21 the server demanded it even with a
+voice present — a requirement that outlived the reason for it.
+
+If your checkout does not sit beside its venv, fish-speech clone and
+weights, write those paths once into **`bin/env.local`** rather than
+exporting them every time:
+
+```bash
+cp bin/env.local.example bin/env.local    # then edit
+```
+
+`bin/env.sh` sources it first, so anything in it wins over the defaults.
+⚠️ It is **gitignored**: it holds absolute paths from one machine, and
+possibly the path to somebody's voice recording.
 
 ```
 POST /v1/audio/speech   {"input": "..."}   ->  audio, OpenAI-compatible
