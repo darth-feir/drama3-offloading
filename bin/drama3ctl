@@ -13,12 +13,16 @@
 #                     notes/17.
 #   DRAMA3_PORT       default 8123
 #   DRAMA3_STT        OpenAI-compatible transcription endpoint
-#   DRAMA3_STT_START  OPTIONAL command that starts a local STT server if
-#                     DRAMA3_STT is not answering. The server transcribes
-#                     the reference clip at startup when DRAMA3_REF_TEXT
-#                     is unset, so a dead STT is a failed boot, not a
-#                     degraded one -- that happened, 20 s before the STT
-#                     came up. Only ever stopped again if WE started it.
+#   DRAMA3_STT_START  OPTIONAL fallback command that starts a local STT
+#                     server if DRAMA3_STT is not answering. Unused when
+#                     something else (e.g. a systemd unit) already serves
+#                     that endpoint -- in which case STT logs go to ITS
+#                     log, not run/stt.log. See start_stt_if_needed.
+#                     ⚠️ The server transcribes the reference clip at
+#                     startup when DRAMA3_REF_TEXT is unset, so a dead
+#                     STT is a FAILED boot, not a degraded one -- that
+#                     happened once, 20 s before STT came up. Only ever
+#                     stopped again if WE started it.
 #
 # ⚠️ Liveness is tracked with a PID FILE, never by matching command-line
 # text. `pgrep -f "[p]ip install"` hung a wait loop indefinitely during this
@@ -29,6 +33,19 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
+
+# ⚠️ Source the environment HERE, not only in bin/run.sh. run.sh sources
+# env.sh for the CHILD; this script's own shell saw none of it, so
+# anything written in bin/env.local -- DRAMA3_STT, DRAMA3_STT_START,
+# DRAMA3_RUN, DRAMA3_VOICES -- was invisible to the launcher.
+#
+# The visible symptom was silence: with DRAMA3_STT unset, stt_ok() says
+# "nothing configured, that is fine" and the autostart block returns
+# early, so STT was never started AND no warning was printed. The user
+# found the content check quietly off.
+# shellcheck disable=SC1091
+[ -f "$REPO/bin/env.sh" ] && source "$REPO/bin/env.sh" >/dev/null 2>&1
+
 RUN="${DRAMA3_RUN:-$REPO/run}"
 PIDFILE="$RUN/server.pid"
 STT_PIDFILE="$RUN/stt.pid"
@@ -80,6 +97,15 @@ stt_ok() {
 }
 
 start_stt_if_needed() {
+    # ⚠️ If something else already owns STT -- a systemd unit, say -- this
+    # returns here and run/stt.log is NEVER written. That is correct, and
+    # it is also a trap: a stale or absent stt.log then looks like
+    # "STT never ran" when STT is in fact healthy and logging elsewhere.
+    #
+    #   systemd user unit  ->  journalctl --user -u parakeet-stt -f
+    #   started by us      ->  run/stt.log  (only then)
+    #
+    # Check the ENDPOINT to know whether STT is alive, never the file.
     stt_ok && return 0
     if [ -z "${DRAMA3_STT_START:-}" ]; then
         echo "note: DRAMA3_STT=$DRAMA3_STT is not answering and" >&2
